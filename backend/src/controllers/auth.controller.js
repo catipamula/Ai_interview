@@ -1,0 +1,105 @@
+"use strict";
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.resetPassword = exports.requestPasswordReset = exports.loginOrganizer = exports.registerOrganizer = void 0;
+const bcrypt_1 = __importDefault(require("bcrypt"));
+const crypto_1 = __importDefault(require("crypto"));
+const jsonwebtoken_1 = __importDefault(require("jsonwebtoken"));
+const db_1 = __importDefault(require("../config/db"));
+const email_service_1 = require("../services/email.service");
+const registerOrganizer = async (req, res) => {
+    try {
+        const { name, email, password, org_name } = req.body;
+        const existing = await db_1.default.organizer.findUnique({ where: { email } });
+        if (existing) {
+            return res.status(400).json({ error: 'Email already exists' });
+        }
+        const password_hash = await bcrypt_1.default.hash(password, 10);
+        const organizer = await db_1.default.organizer.create({
+            data: { name, email, password_hash, org_name }
+        });
+        res.status(201).json({ message: 'Organizer created successfully', organizerId: organizer.id });
+    }
+    catch (error) {
+        res.status(500).json({ error: 'Internal server error' });
+    }
+};
+exports.registerOrganizer = registerOrganizer;
+const loginOrganizer = async (req, res) => {
+    try {
+        const { email, password } = req.body;
+        const organizer = await db_1.default.organizer.findUnique({ where: { email } });
+        if (!organizer) {
+            return res.status(401).json({ error: 'Invalid credentials' });
+        }
+        const isMatch = await bcrypt_1.default.compare(password, organizer.password_hash);
+        if (!isMatch) {
+            return res.status(401).json({ error: 'Invalid credentials' });
+        }
+        const secret = process.env.JWT_SECRET || 'supersecret_for_local_dev';
+        const token = jsonwebtoken_1.default.sign({ id: organizer.id }, secret, { expiresIn: '1d' });
+        res.json({ token, organizer: { id: organizer.id, name: organizer.name, org_name: organizer.org_name } });
+    }
+    catch (error) {
+        res.status(500).json({ error: 'Internal server error' });
+    }
+};
+exports.loginOrganizer = loginOrganizer;
+const requestPasswordReset = async (req, res) => {
+    const genericResponse = { message: 'If an account exists for that email, a password reset link has been sent.' };
+    try {
+        const email = typeof req.body.email === 'string' ? req.body.email.trim().toLowerCase() : '';
+        if (!email)
+            return res.json(genericResponse);
+        const organizer = await db_1.default.organizer.findUnique({ where: { email } });
+        if (!organizer)
+            return res.json(genericResponse);
+        (0, email_service_1.assertEmailConfiguration)();
+        const rawToken = crypto_1.default.randomBytes(32).toString('hex');
+        const tokenHash = crypto_1.default.createHash('sha256').update(rawToken).digest('hex');
+        const expiresAt = new Date(Date.now() + 60 * 60 * 1000);
+        await db_1.default.passwordResetToken.deleteMany({ where: { organizer_id: organizer.id } });
+        await db_1.default.passwordResetToken.create({
+            data: { organizer_id: organizer.id, token_hash: tokenHash, expires_at: expiresAt }
+        });
+        const frontendUrl = process.env.PUBLIC_FRONTEND_URL || process.env.FRONTEND_URL;
+        if (!frontendUrl)
+            throw new Error('FRONTEND_URL is not configured');
+        const resetLink = `${frontendUrl.replace(/\/$/, '')}/reset-password?token=${rawToken}`;
+        await (0, email_service_1.sendPasswordResetEmail)(organizer.email, resetLink);
+        return res.json(genericResponse);
+    }
+    catch (error) {
+        console.error('Failed to request password reset:', error);
+        return res.status(500).json({ error: 'Unable to send password reset email. Check the SMTP settings and server logs.' });
+    }
+};
+exports.requestPasswordReset = requestPasswordReset;
+const resetPassword = async (req, res) => {
+    try {
+        const token = typeof req.body.token === 'string' ? req.body.token : '';
+        const password = typeof req.body.password === 'string' ? req.body.password : '';
+        if (!token || password.length < 8) {
+            return res.status(400).json({ error: 'A valid token and a password of at least 8 characters are required.' });
+        }
+        const tokenHash = crypto_1.default.createHash('sha256').update(token).digest('hex');
+        const resetToken = await db_1.default.passwordResetToken.findUnique({ where: { token_hash: tokenHash } });
+        if (!resetToken || resetToken.used_at || resetToken.expires_at <= new Date()) {
+            return res.status(400).json({ error: 'This password reset link is invalid or expired.' });
+        }
+        const passwordHash = await bcrypt_1.default.hash(password, 10);
+        await db_1.default.$transaction([
+            db_1.default.organizer.update({ where: { id: resetToken.organizer_id }, data: { password_hash: passwordHash } }),
+            db_1.default.passwordResetToken.update({ where: { id: resetToken.id }, data: { used_at: new Date() } })
+        ]);
+        return res.json({ message: 'Password reset successfully. You can now sign in.' });
+    }
+    catch (error) {
+        console.error('Failed to reset password:', error);
+        return res.status(500).json({ error: 'Unable to reset password.' });
+    }
+};
+exports.resetPassword = resetPassword;
+//# sourceMappingURL=auth.controller.js.map
