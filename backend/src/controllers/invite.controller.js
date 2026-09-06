@@ -4,6 +4,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 };
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.acceptTerms = exports.validateToken = void 0;
+const jsonwebtoken_1 = __importDefault(require("jsonwebtoken"));
 const db_1 = __importDefault(require("../config/db"));
 const validateToken = async (req, res) => {
     try {
@@ -41,6 +42,9 @@ const acceptTerms = async (req, res) => {
         if (!invite || invite.status !== 'pending') {
             return res.status(400).json({ error: 'Invalid or used token' });
         }
+        if (new Date() > invite.expires_at) {
+            return res.status(400).json({ error: 'Token expired' });
+        }
         await db_1.default.inviteToken.update({
             where: { id: invite.id },
             data: { status: 'used' }
@@ -48,11 +52,20 @@ const acceptTerms = async (req, res) => {
         const session = await db_1.default.interviewSession.create({
             data: {
                 candidate_id: invite.candidate_id,
-                status: 'in-progress',
-                started_at: new Date()
+                status: 'invited'
             }
         });
-        res.json({ message: 'Terms accepted, session created', sessionId: session.id });
+        const secret = process.env.JWT_SECRET || 'supersecret_for_local_dev';
+        const interviewAccessToken = jsonwebtoken_1.default.sign({
+            purpose: 'candidate-interview',
+            sessionId: session.id,
+            candidateId: invite.candidate_id
+        }, secret, { expiresIn: '2h' });
+        res.json({
+            message: 'Terms accepted, session created',
+            sessionId: session.id,
+            interviewAccessToken
+        });
     }
     catch (error) {
         res.status(500).json({ error: 'Failed to accept terms' });

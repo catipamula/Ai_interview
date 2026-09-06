@@ -19,19 +19,6 @@ const nextConfig: NextConfig = {
     ];
   },
 
-  // face-api.js contains Node-only code that imports fs/path/crypto.
-  // Tell webpack not to resolve those built-ins in the browser bundle.
-  webpack: (config, { isServer }) => {
-    if (!isServer) {
-      config.resolve.fallback = {
-        ...config.resolve.fallback,
-        fs: false,
-        path: false,
-        crypto: false,
-      };
-    }
-    return config;
-  },
 };
 
 export default nextConfig;

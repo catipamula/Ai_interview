@@ -3,6 +3,7 @@ export declare const sendInterviewInvitationEmail: (candidate: {
     name: string;
     email: string;
 }, inviteLink: string) => Promise<import("nodemailer/lib/smtp-transport").SentMessageInfo>;
+export declare const sendPasswordResetEmail: (email: string, resetLink: string) => Promise<import("nodemailer/lib/smtp-transport").SentMessageInfo>;
 export declare const sendInterviewResultEmail: (candidate: {
     name: string;
     email: string;

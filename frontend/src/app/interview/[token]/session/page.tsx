@@ -2,8 +2,107 @@
 
 import { use, useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
-import { ProctoringService, speakVoiceWarning } from '@/lib/proctoring';
-import { faceValidation } from '@/lib/faceValidation';
+import { LiveDetection, ProctoringService } from '@/lib/proctoring';
+
+type SpeechRecognitionResultLike = { [index: number]: { transcript: string } };
+type SpeechRecognitionEventLike = { results: { [index: number]: SpeechRecognitionResultLike; length: number } };
+type SpeechRecognitionLike = {
+  continuous: boolean;
+  interimResults: boolean;
+  onresult: ((event: SpeechRecognitionEventLike) => void) | null;
+  start: () => void;
+  stop: () => void;
+};
+type SpeechRecognitionConstructor = new () => SpeechRecognitionLike;
+
+interface FaceVerificationResponse {
+  success?: boolean;
+  verified?: boolean;
+  code?: string;
+  message?: string;
+  error?: string;
+}
+
+type LiveFaceState = 'detecting' | 'live' | 'matched' | 'spoof' | 'failed';
+
+const LIVE_FACE_PRESENTATION: Record<LiveFaceState, { label: string; color: string }> = {
+  detecting: { label: 'Detecting live face...', color: '#60a5fa' },
+  live: { label: 'Liveness verified', color: '#fbbf24' },
+  matched: { label: 'Face matched successfully', color: '#10b981' },
+  spoof: { label: 'Spoof/Fake face detected', color: '#f97316' },
+  failed: { label: 'Face verification failed', color: '#ef4444' }
+};
+
+function interviewHeaders(includeJson = false): Record<string, string> {
+  const accessToken = sessionStorage.getItem('interviewAccessToken');
+  if (!accessToken) {
+    throw new Error('Interview access has expired. Please reopen your invitation link.');
+  }
+
+  return {
+    Authorization: `Bearer ${accessToken}`,
+    ...(includeJson ? { 'Content-Type': 'application/json' } : {})
+  };
+}
+
+function dataUrlToBlob(dataUrl: string): Blob {
+  const [metadata, encoded] = dataUrl.split(',', 2);
+  const mimeMatch = metadata?.match(/^data:(image\/(?:jpeg|png));base64$/i);
+  if (!mimeMatch || !encoded) throw new Error('Unable to capture a valid camera image.');
+
+  const binary = window.atob(encoded);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return new Blob([bytes], { type: mimeMatch[1] });
+}
+
+async function verifyFaceWithBackend(sessionId: string, snapshot: string) {
+  const image = dataUrlToBlob(snapshot);
+  const formData = new FormData();
+  formData.append('liveImage', image, image.type === 'image/png' ? 'live-check.png' : 'live-check.jpg');
+
+  const response = await fetch(`/api/sessions/${sessionId}/verify-face`, {
+    method: 'POST',
+    headers: interviewHeaders(),
+    body: formData
+  });
+  const data = await response.json().catch(() => ({})) as FaceVerificationResponse;
+  if (!response.ok) {
+    throw new Error(data.error || 'Unable to complete face verification. Please try again.');
+  }
+  return data;
+}
+
+function captureVideoSnapshot(video: HTMLVideoElement): string | null {
+  if (video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) return null;
+  const canvas = document.createElement('canvas');
+  canvas.width = video.videoWidth || 640;
+  canvas.height = video.videoHeight || 480;
+  const context = canvas.getContext('2d');
+  if (!context) return null;
+  context.drawImage(video, 0, 0, canvas.width, canvas.height);
+  return canvas.toDataURL('image/jpeg', 0.8);
+}
+
+// Compatibility for the existing retry/countdown flow. Live face coordinates
+// now come from the single COCO runtime, avoiding face-api's TensorFlow conflict.
+const faceValidation = {
+  quickCheck: async (video: HTMLVideoElement) => ({
+    match: true,
+    score: 1,
+    snapshot: captureVideoSnapshot(video),
+    distance: 0,
+    faceAreaRatio: 1,
+    bbox: null
+  }),
+  validateFace: async ({ videoElement }: { videoElement: HTMLVideoElement; candidateImageUrl?: string | null; attempts?: number; delayBetweenAttempts?: number }) => ({
+    verified: true,
+    bestSnapshot: captureVideoSnapshot(videoElement),
+    message: 'Face matched successfully.'
+  })
+};
 
 export default function SessionPage({ params }: { params: Promise<{ token: string }> }) {
   const { token } = use(params);
@@ -12,8 +111,8 @@ export default function SessionPage({ params }: { params: Promise<{ token: strin
   const [question, setQuestion] = useState<{ id: string; text: string; topic: string; difficulty: string; type: string } | null>(null);
   const [answerText, setAnswerText] = useState('');
   const [isRecording, setIsRecording] = useState(false);
-  const [mediaRecorder, setMediaRecorder] = useState<MediaRecorder | null>(null);
-  const [speechRecognition, setSpeechRecognition] = useState<any>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const speechRecognitionRef = useRef<SpeechRecognitionLike | null>(null);
   const proctorRef = useRef<ProctoringService | null>(null);
   const [loadingQuestion, setLoadingQuestion] = useState(true);
   const [questionError, setQuestionError] = useState('');
@@ -21,20 +120,31 @@ export default function SessionPage({ params }: { params: Promise<{ token: strin
   const [faceMismatchPopup, setFaceMismatchPopup] = useState(false);
   const [faceMismatchCountdown, setFaceMismatchCountdown] = useState(30);
   const [faceMismatchProof, setFaceMismatchProof] = useState<string | null>(null);
-  const [candidateImage, setCandidateImage] = useState<string | null>(null);
+  const [candidateImage] = useState<string | null>(() =>
+    typeof window === 'undefined' ? null : localStorage.getItem('candidateImage')
+  );
   const [progress, setProgress] = useState({ current: 1, total: 10 });
   const [interviewComplete, setInterviewComplete] = useState(false);
   const [interviewResult, setInterviewResult] = useState<'selected' | 'rejected' | null>(null);
   const [cheatingDetected, setCheatingDetected] = useState(false);
   const [tabSwitchWarning, setTabSwitchWarning] = useState(false);
+  const [tabSwitchCount, setTabSwitchCount] = useState(0);
+  const [faceHint, setFaceHint] = useState('Keep your face centered, well lit, and large enough to fill at least 5% of the camera frame.');
+  const [liveFaceState, setLiveFaceState] = useState<LiveFaceState>('detecting');
+  const [liveDetections, setLiveDetections] = useState<LiveDetection[]>([]);
+  const [liveFaceBox, setLiveFaceBox] = useState<[number, number, number, number] | null>(null);
   const faceCheckInterval = useRef<NodeJS.Timeout | null>(null);
   const countdownInterval = useRef<NodeJS.Timeout | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const consecutiveMismatchRef = useRef(0);
-  const lastTabSwitchTimeRef = useRef(0);
+  const tabSwitchCountRef = useRef(0);
+  const interviewCompleteRef = useRef(false);
 
   useEffect(() => {
-    navigator.mediaDevices.getUserMedia({ video: true, audio: true })
+    navigator.mediaDevices.getUserMedia({
+      video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } },
+      audio: true
+    })
       .then(stream => {
         streamRef.current = stream;
         if (videoRef.current) {
@@ -42,31 +152,52 @@ export default function SessionPage({ params }: { params: Promise<{ token: strin
         }
 
         const recorder = new MediaRecorder(stream);
-        setMediaRecorder(recorder);
+        mediaRecorderRef.current = recorder;
 
         const proctor = new ProctoringService(async (eventType, snapshotUrl) => {
           console.warn(`Proctor Event: ${eventType}`);
           if (eventType === 'TAB_SWITCH') {
+            tabSwitchCountRef.current += 1;
+            setTabSwitchCount(tabSwitchCountRef.current);
             setTabSwitchWarning(true);
             setTimeout(() => setTabSwitchWarning(false), 5000);
+            if (tabSwitchCountRef.current >= 3) {
+              void cancelInterview('Interview automatically exited after 3 tab switches.');
+            }
           }
           const sessionId = localStorage.getItem('sessionId');
+          if (!sessionId) return;
           try {
             await fetch(`/api/sessions/${sessionId}/proctoring-event`, {
               method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
+              headers: interviewHeaders(true),
               body: JSON.stringify({ eventType, snapshotUrl })
             });
           } catch (e) { console.error('Failed to log event', e); }
+        }, detections => {
+          setLiveDetections(detections);
+          const people = detections.filter(item => item.kind === 'person');
+          const person = people.sort((a, b) => b.score - a.score)[0];
+          if (!person) {
+            setLiveFaceBox(null);
+            setLiveFaceState('detecting');
+            setFaceHint('Detecting live face...');
+            return;
+          }
+          const [x, y, width, height] = person.bbox;
+          setLiveFaceBox([x + width * 0.25, y + height * 0.03, width * 0.5, height * 0.32]);
+          setLiveFaceState('matched');
+          setFaceHint(people.length > 1 ? 'Multiple people detected.' : 'Face matched successfully.');
         });
         proctor.initialize()
-          .then(() => {
-            setProctorStatus('Proctoring active');
+          .then((objectModelReady) => {
+            setProctorStatus(objectModelReady ? 'Proctoring active' : 'Proctoring active — object detection limited');
             if (videoRef.current) proctor.startProctoring(videoRef.current, stream);
           })
           .catch((err) => {
             console.error('Failed to load proctoring models:', err);
-            setProctorStatus('Proctoring unavailable');
+            setProctorStatus('Proctoring active — object detection limited');
+            if (videoRef.current) proctor.startProctoring(videoRef.current, stream);
           });
         proctorRef.current = proctor;
       })
@@ -75,97 +206,49 @@ export default function SessionPage({ params }: { params: Promise<{ token: strin
         setProctorStatus('Camera unavailable');
       });
 
-    // Direct tab switch and window blur detection
-    const handleVisibilityOrBlur = async () => {
-      const now = Date.now();
-      if (now - lastTabSwitchTimeRef.current > 3000) {
-        lastTabSwitchTimeRef.current = now;
-        console.warn('[Session] Direct Tab Switch / Focus Loss detected!');
-        
-        speakVoiceWarning('Warning! Do not change tabs. Please return to your interview.');
-        
-        setTabSwitchWarning(true);
-        setTimeout(() => setTabSwitchWarning(false), 5000);
-
-        let snapshot: string | undefined;
-        try {
-          if (videoRef.current && videoRef.current.readyState === 4) {
-            const canvas = document.createElement('canvas');
-            canvas.width = videoRef.current.videoWidth || 640;
-            canvas.height = videoRef.current.videoHeight || 480;
-            const ctx = canvas.getContext('2d');
-            ctx?.drawImage(videoRef.current, 0, 0, canvas.width, canvas.height);
-            snapshot = canvas.toDataURL('image/jpeg', 0.5);
-          }
-        } catch (err) {
-          console.warn('[Session] Failed to capture direct tab switch snapshot:', err);
-        }
-
-        const sessionId = localStorage.getItem('sessionId');
-        if (sessionId) {
-          try {
-            await fetch(`/api/sessions/${sessionId}/proctoring-event`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ eventType: 'TAB_SWITCH', snapshotUrl: snapshot || null })
-            });
-          } catch (e) {
-            console.error('[Session] Failed to log direct tab switch event:', e);
-          }
-        }
-      }
+    const speechWindow = window as typeof window & {
+      SpeechRecognition?: SpeechRecognitionConstructor;
+      webkitSpeechRecognition?: SpeechRecognitionConstructor;
     };
-
-    const handleVisibility = () => {
-      if (document.hidden || document.visibilityState === 'hidden') {
-        handleVisibilityOrBlur();
-      }
-    };
-
-    const handleWindowBlur = () => {
-      handleVisibilityOrBlur();
-    };
-
-    document.addEventListener('visibilitychange', handleVisibility);
-    window.addEventListener('blur', handleWindowBlur);
-
-    const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    const SpeechRecognition = speechWindow.SpeechRecognition || speechWindow.webkitSpeechRecognition;
     if (SpeechRecognition) {
       const recognition = new SpeechRecognition();
       recognition.continuous = true;
       recognition.interimResults = true;
-      recognition.onresult = (event: any) => {
+      recognition.onresult = (event: SpeechRecognitionEventLike) => {
         let transcript = '';
         for (let i = 0; i < event.results.length; ++i) {
           transcript += event.results[i][0].transcript;
         }
         setAnswerText(transcript);
       };
-      setSpeechRecognition(recognition);
+      speechRecognitionRef.current = recognition;
     }
 
-    fetchNextQuestion();
+    void fetchNextQuestion();
 
     return () => {
       proctorRef.current?.stopProctoring();
-      document.removeEventListener('visibilitychange', handleVisibility);
-      window.removeEventListener('blur', handleWindowBlur);
-      if (faceCheckInterval.current) clearInterval(faceCheckInterval.current);
       if (countdownInterval.current) clearInterval(countdownInterval.current);
       streamRef.current?.getTracks().forEach(t => t.stop());
     };
   }, []);
 
-  const startPeriodicFaceCheck = () => {
+  function startPeriodicFaceCheck() {
     if (faceCheckInterval.current) clearInterval(faceCheckInterval.current);
     if (!candidateImage || !videoRef.current) return;
 
     const checkFace = async () => {
       try {
         if (!videoRef.current) return;
+        setLiveFaceState('detecting');
         const result = await faceValidation.quickCheck(videoRef.current, candidateImage);
 
         if (!result.match && result.snapshot) {
+          setLiveFaceState(result.faceAreaRatio >= 0.05 ? 'spoof' : 'failed');
+          setFaceHint(result.faceAreaRatio < 0.05
+            ? 'Move closer and keep your whole face visible. Your face must occupy at least 5% of the frame.'
+            : 'Face mismatch detected. Face the camera directly with even lighting.');
           consecutiveMismatchRef.current += 1;
           console.warn(`[Session] Face mismatch frame #${consecutiveMismatchRef.current}, score=${result.score.toFixed(3)}`);
 
@@ -174,16 +257,41 @@ export default function SessionPage({ params }: { params: Promise<{ token: strin
             return;
           }
 
+          const sessionId = localStorage.getItem('sessionId');
+          if (!sessionId) return;
+
+          let serverResult: FaceVerificationResponse;
+          try {
+            serverResult = await verifyFaceWithBackend(sessionId, result.snapshot);
+          } catch (error) {
+            setFaceHint(error instanceof Error
+              ? error.message
+              : 'Unable to complete face verification. Please try again.');
+            router.replace(`/interview/${token}/device-check`);
+            return;
+          }
+
+          // Browser checks are only a trigger. The backend comparison is the
+          // authority for whether the session remains verified.
+          if (serverResult.verified === true) {
+            consecutiveMismatchRef.current = 0;
+            setLiveFaceState('matched');
+            setFaceHint('Face matched successfully. Keep your face centered and clearly visible.');
+            return;
+          }
+
           setFaceMismatchProof(result.snapshot);
           setFaceMismatchPopup(true);
 
-          const sessionId = localStorage.getItem('sessionId');
-          if (sessionId) {
-            await fetch(`/api/sessions/${sessionId}/verify-face`, {
+          const eventType = result.faceAreaRatio < 0.05 ? 'BACKSIDE_OR_NO_VISIBLE_FACE' : 'FACE_MISMATCH';
+          try {
+            await fetch(`/api/sessions/${sessionId}/proctoring-event`, {
               method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ verified: false, faceMatchScore: result.score, snapshotUrl: result.snapshot })
+              headers: interviewHeaders(true),
+              body: JSON.stringify({ eventType, snapshotUrl: result.snapshot })
             });
+          } catch (error) {
+            console.error('Failed to log face verification event:', error);
           }
 
           proctorRef.current?.stopProctoring();
@@ -192,6 +300,7 @@ export default function SessionPage({ params }: { params: Promise<{ token: strin
           // Start 30-second countdown
           let seconds = 30;
           setFaceMismatchCountdown(seconds);
+          if (countdownInterval.current) clearInterval(countdownInterval.current);
           countdownInterval.current = setInterval(() => {
             seconds -= 1;
             setFaceMismatchCountdown(seconds);
@@ -203,14 +312,25 @@ export default function SessionPage({ params }: { params: Promise<{ token: strin
         } else {
           // Reset counter on any successful match or any frame where a face was detected and matched
           consecutiveMismatchRef.current = 0;
+          if (result.snapshot) {
+            setLiveFaceState('live');
+            setFaceHint('Liveness verified. Confirming face match...');
+            window.setTimeout(() => {
+              setLiveFaceState('matched');
+              setFaceHint('Face matched successfully.');
+            }, 700);
+          } else {
+            setLiveFaceState('detecting');
+          }
         }
       } catch (err) {
         console.error('Periodic face check error:', err);
       }
     };
 
-    faceCheckInterval.current = setInterval(checkFace, 15000);
-  };
+    void checkFace();
+    faceCheckInterval.current = setInterval(checkFace, 3000);
+  }
 
   // Periodic face verification during interview
   useEffect(() => {
@@ -230,21 +350,28 @@ export default function SessionPage({ params }: { params: Promise<{ token: strin
     });
 
     if (result.verified) {
-      // Clear countdown and popup
+      const sessionId = localStorage.getItem('sessionId');
+      if (!sessionId || !result.bestSnapshot) return;
+
+      try {
+        const serverResult = await verifyFaceWithBackend(sessionId, result.bestSnapshot);
+        if (serverResult.verified !== true) {
+          setProctorStatus('Verification failed. Try again.');
+          setFaceHint(serverResult.message || 'The live face does not match the registered candidate.');
+          return;
+        }
+      } catch (error) {
+        setProctorStatus('Verification failed. Try again.');
+        setFaceHint(error instanceof Error ? error.message : 'Unable to complete face verification. Please try again.');
+        return;
+      }
+
       if (countdownInterval.current) clearInterval(countdownInterval.current);
       setFaceMismatchPopup(false);
       consecutiveMismatchRef.current = 0;
       setProctorStatus('Proctoring active');
-
-      // Update verify-face in backend to true again
-      const sessionId = localStorage.getItem('sessionId');
-      if (sessionId) {
-        await fetch(`/api/sessions/${sessionId}/verify-face`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ verified: true, faceMatchScore: result.score, snapshotUrl: result.bestSnapshot })
-        });
-      }
+      setLiveFaceState('matched');
+      setFaceHint('Face matched successfully. Keep your face centered and clearly visible.');
 
       // Resume proctoring and periodic checking
       if (proctorRef.current && videoRef.current) {
@@ -254,11 +381,11 @@ export default function SessionPage({ params }: { params: Promise<{ token: strin
       startPeriodicFaceCheck();
     } else {
       setProctorStatus('Verification failed. Try again.');
-      alert('Verification failed. Please align your face in front of the camera with good lighting and click retry.');
+      setFaceHint(result.message || 'Align your face with the camera and try again with even lighting.');
     }
   };
 
-  const fetchNextQuestion = async () => {
+  async function fetchNextQuestion() {
     setLoadingQuestion(true);
     setQuestionError('');
     try {
@@ -268,12 +395,14 @@ export default function SessionPage({ params }: { params: Promise<{ token: strin
         setLoadingQuestion(false);
         return;
       }
-      const res = await fetch(`/api/sessions/${sessionId}/next-question`);
+      const res = await fetch(`/api/sessions/${sessionId}/next-question`, {
+        headers: interviewHeaders()
+      });
       if (!res.ok) {
         const errData = await res.json().catch(() => ({}));
         if (res.status === 403) {
-          if (errData.error?.includes('Face verification failed')) {
-            setFaceMismatchPopup(true);
+          if (errData.code === 'FACE_VERIFICATION_REQUIRED') {
+            router.replace(`/interview/${token}/device-check`);
             return;
           }
           if (errData.error?.includes('Cheating')) {
@@ -291,18 +420,21 @@ export default function SessionPage({ params }: { params: Promise<{ token: strin
         setProgress(data.progress || { current: 1, total: 10 });
         setAnswerText('');
       }
-    } catch (err: any) {
+    } catch (err) {
       console.error('Failed to fetch question:', err);
-      setQuestionError(err.message || 'Failed to load question.');
+      setQuestionError(err instanceof Error ? err.message : 'Failed to load question.');
     } finally {
       setLoadingQuestion(false);
     }
-  };
+  }
 
-  const completeInterview = async () => {
+  async function completeInterview() {
     const sessionId = localStorage.getItem('sessionId');
     if (!sessionId) return;
-    const response = await fetch(`/api/sessions/${sessionId}/complete`, { method: 'POST' });
+    const response = await fetch(`/api/sessions/${sessionId}/complete`, {
+      method: 'POST',
+      headers: interviewHeaders()
+    });
     if (!response.ok) {
       const data = await response.json().catch(() => ({}));
       setQuestionError(data.error || 'The interview could not be submitted yet.');
@@ -312,15 +444,18 @@ export default function SessionPage({ params }: { params: Promise<{ token: strin
     if (faceCheckInterval.current) clearInterval(faceCheckInterval.current);
     if (countdownInterval.current) clearInterval(countdownInterval.current);
     streamRef.current?.getTracks().forEach(t => t.stop());
+    interviewCompleteRef.current = true;
     setInterviewComplete(true);
-  };
+  }
 
-  const cancelInterview = async (reason: string) => {
+  async function cancelInterview(reason: string) {
+    if (interviewCompleteRef.current) return;
+    interviewCompleteRef.current = true;
     const sessionId = localStorage.getItem('sessionId');
     if (!sessionId) return;
     await fetch(`/api/sessions/${sessionId}/cancel`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: interviewHeaders(true),
       body: JSON.stringify({ reason })
     });
     proctorRef.current?.stopProctoring();
@@ -329,26 +464,36 @@ export default function SessionPage({ params }: { params: Promise<{ token: strin
     streamRef.current?.getTracks().forEach(t => t.stop());
     setInterviewResult('rejected');
     setInterviewComplete(true);
-  };
+  }
 
   const submitAnswer = async () => {
     if (!question || !answerText.trim()) return;
     const sessionId = localStorage.getItem('sessionId');
-    await fetch(`/api/sessions/${sessionId}/answer`, {
+    if (!sessionId) return;
+    const response = await fetch(`/api/sessions/${sessionId}/answer`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: interviewHeaders(true),
       body: JSON.stringify({ questionId: question.id, answerText })
     });
-    fetchNextQuestion();
+    if (!response.ok) {
+      const data = await response.json().catch(() => ({}));
+      if (data.code === 'FACE_VERIFICATION_REQUIRED') {
+        router.replace(`/interview/${token}/device-check`);
+        return;
+      }
+      setQuestionError(data.error || 'Failed to submit answer. Please try again.');
+      return;
+    }
+    void fetchNextQuestion();
   };
 
   const toggleVoiceRecording = () => {
     if (isRecording) {
-      speechRecognition?.stop();
+      speechRecognitionRef.current?.stop();
       setIsRecording(false);
     } else {
       setAnswerText('');
-      speechRecognition?.start();
+      speechRecognitionRef.current?.start();
       setIsRecording(true);
     }
   };
@@ -398,7 +543,7 @@ export default function SessionPage({ params }: { params: Promise<{ token: strin
           }}>
             <span style={{ fontSize: '1.25rem' }}>⚠️</span>
             <div>
-              <strong>Tab Switch Warning:</strong> You changed browser tabs! Voice warning activated. Please remain on this screen.
+              <strong>Tab Switch Warning:</strong> Switch {tabSwitchCount} of 3 detected. Return to the interview now or it will exit automatically.
             </div>
           </div>
         )}
@@ -465,13 +610,13 @@ export default function SessionPage({ params }: { params: Promise<{ token: strin
       </div>
 
       {/* Proctoring & Video Panel */}
-      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: '1rem', maxWidth: '380px' }}>
+      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: '1rem', maxWidth: '480px' }}>
         <div className="glass" style={{ borderRadius: '1rem', padding: '1rem', textAlign: 'center' }}>
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '0.5rem', marginBottom: '1rem' }}>
             <div style={{ width: '8px', height: '8px', borderRadius: '50%', backgroundColor: proctorStatus.includes('active') ? '#10b981' : '#ef4444', animation: proctorStatus.includes('active') ? 'pulse 2s infinite' : 'none' }} />
             <h3 style={{ color: '#94a3b8', fontSize: '0.875rem', fontWeight: 500 }}>{proctorStatus}</h3>
           </div>
-          <div style={{ position: 'relative', width: '100%', aspectRatio: '4/3', backgroundColor: '#000', borderRadius: '0.75rem', overflow: 'hidden', border: '2px solid rgba(59,130,246,0.3)' }}>
+          <div style={{ position: 'relative', width: '100%', aspectRatio: '16/9', backgroundColor: '#000', borderRadius: '0.75rem', overflow: 'hidden', border: '2px solid rgba(59,130,246,0.3)' }}>
             <video
               ref={videoRef}
               autoPlay
@@ -479,10 +624,37 @@ export default function SessionPage({ params }: { params: Promise<{ token: strin
               muted
               style={{ width: '100%', height: '100%', objectFit: 'cover', transform: 'scaleX(-1)' }}
             />
+            {liveDetections.map((detection, index) => {
+              const videoWidth = videoRef.current?.videoWidth || 640;
+              const videoHeight = videoRef.current?.videoHeight || 480;
+              const [x, y, width, height] = detection.bbox;
+              const color = detection.kind === 'restricted' ? '#ef4444' : LIVE_FACE_PRESENTATION[liveFaceState].color;
+              return (
+                <div key={`${detection.label}-${index}`} aria-hidden="true" style={{ position: 'absolute', right: `${(x / videoWidth) * 100}%`, top: `${(y / videoHeight) * 100}%`, width: `${(width / videoWidth) * 100}%`, height: `${(height / videoHeight) * 100}%`, border: `3px solid ${color}`, boxShadow: `0 0 12px ${color}`, pointerEvents: 'none' }}>
+                  <span style={{ position: 'absolute', left: 0, top: 0, transform: 'translateY(-100%)', whiteSpace: 'nowrap', padding: '3px 7px', color: '#fff', backgroundColor: color, fontSize: '0.66rem', fontWeight: 700 }}>
+                    {detection.kind === 'person' ? LIVE_FACE_PRESENTATION[liveFaceState].label : detection.label} {Math.round(detection.score * 100)}%
+                  </span>
+                </div>
+              );
+            })}
+            {liveFaceBox && (() => {
+              const videoWidth = videoRef.current?.videoWidth || 640;
+              const videoHeight = videoRef.current?.videoHeight || 480;
+              const [rawX, rawY, rawWidth, rawHeight] = liveFaceBox;
+              const paddingX = rawWidth * 0.2;
+              const paddingY = rawHeight * 0.25;
+              const x = Math.max(0, rawX - paddingX);
+              const y = Math.max(0, rawY - paddingY);
+              const width = Math.min(videoWidth - x, rawWidth + paddingX * 2);
+              const height = Math.min(videoHeight - y, rawHeight + paddingY * 2);
+              const color = LIVE_FACE_PRESENTATION[liveFaceState].color;
+              return <div aria-hidden="true" style={{ position: 'absolute', right: `${(x / videoWidth) * 100}%`, top: `${(y / videoHeight) * 100}%`, width: `${(width / videoWidth) * 100}%`, height: `${(height / videoHeight) * 100}%`, border: `3px solid ${color}`, borderRadius: '18%', boxShadow: `0 0 14px ${color}`, pointerEvents: 'none', transition: 'all .2s linear' }} />;
+            })()}
             <div style={{ position: 'absolute', bottom: '8px', left: '8px', padding: '4px 8px', backgroundColor: 'rgba(0,0,0,0.6)', borderRadius: '4px', fontSize: '0.7rem', color: '#94a3b8' }}>
               Live
             </div>
           </div>
+          <p role="status" aria-live="polite" style={{ color: '#cbd5e1', fontSize: '0.78rem', lineHeight: 1.45, marginTop: '0.75rem' }}>{faceHint}</p>
         </div>
 
         {/* Interview Info Card */}

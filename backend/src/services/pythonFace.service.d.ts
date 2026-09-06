@@ -1,10 +1,12 @@
 export interface PythonFaceResult {
+    success: boolean;
     verified: boolean;
-    score: number;
-    distance: number;
+    code: string;
+    distance: number | null;
+    threshold: number;
     message: string;
-    ref_face_found: boolean;
-    live_face_found: boolean;
+    reference_face_count: number;
+    live_face_count: number;
 }
-export declare function compareFacesWithPython(referenceImageUrl: string, liveSnapshotDataUrl: string): Promise<PythonFaceResult>;
+export declare function compareFacesWithPython(referenceImageUrl: string, liveImageBuffer: Buffer): Promise<PythonFaceResult>;
 //# sourceMappingURL=pythonFace.service.d.ts.map

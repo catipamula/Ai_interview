@@ -41,8 +41,19 @@ export default function ReportPage({ params }: { params: Promise<{ id: string }>
     </div>
   );
 
-  const session = candidate.sessions?.[0];
-  const rejectionProofs = session?.rejection_proofs ? JSON.parse(session.rejection_proofs) : [];
+  const session = candidate.sessions?.find((item: { status: string }) =>
+    ['completed', 'rejected', 'cancelled'].includes(item.status)
+  ) || candidate.sessions?.[0];
+  const proctorEvents = session?.proctorEvents || [];
+  const eventCount = (eventType: string) => proctorEvents.filter((event: { event_type: string }) => event.event_type === eventType).length;
+  let rejectionProofs: string[] = [];
+  if (session?.rejection_proofs) {
+    try {
+      rejectionProofs = JSON.parse(session.rejection_proofs);
+    } catch {
+      rejectionProofs = [];
+    }
+  }
 
   const getResultBadge = () => {
     if (!session?.result) return null;
@@ -146,9 +157,9 @@ export default function ReportPage({ params }: { params: Promise<{ id: string }>
             </div>
             <div className="glass stat-card">
               <div className="stat-value" style={{ color: session.face_verified ? '#10b981' : '#ef4444' }}>
-                {session.face_verified ? 'Yes' : 'No'}
+                {session.face_verified ? 'Passed Successfully' : 'Not Passed'}
               </div>
-              <div className="stat-label">Face Verified</div>
+              <div className="stat-label">Face Verification</div>
             </div>
             <div className="glass stat-card">
               <div className="stat-value" style={{ color: session.total_answered > 0 ? '#3b82f6' : '#64748b' }}>
@@ -164,6 +175,17 @@ export default function ReportPage({ params }: { params: Promise<{ id: string }>
             </div>
           </div>
 
+          <div className="glass" style={{ padding: '1.5rem', borderRadius: '1rem' }}>
+            <h2 style={{ fontSize: '1.25rem', marginBottom: '1rem', fontWeight: 600 }}>Detection Analysis</h2>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(170px, 1fr))', gap: '0.75rem' }}>
+              <div><strong>{eventCount('RESTRICTED_OBJECT')}</strong><div className="stat-label">Phone or restricted object</div></div>
+              <div><strong>{eventCount('MULTIPLE_FACES')}</strong><div className="stat-label">Extra person detected</div></div>
+              <div><strong>{eventCount('BACKSIDE_OR_NO_VISIBLE_FACE')}</strong><div className="stat-label">Backside or no visible face</div></div>
+              <div><strong>{eventCount('TAB_SWITCH')}</strong><div className="stat-label">Tab switches</div></div>
+              <div><strong>{eventCount('NO_FACE')}</strong><div className="stat-label">No person detected</div></div>
+            </div>
+          </div>
+
           {/* Proctoring Timeline */}
           <div className="glass" style={{ padding: '1.5rem', borderRadius: '1rem' }}>
             <h2 style={{ fontSize: '1.25rem', marginBottom: '1rem', fontWeight: 600 }}>Proctoring Timeline</h2>
@@ -175,8 +197,10 @@ export default function ReportPage({ params }: { params: Promise<{ id: string }>
                       {Math.floor(evt.timestamp_in_session / 60)}:{(evt.timestamp_in_session % 60).toString().padStart(2, '0')}
                     </div>
                     <div style={{ flex: 1 }}>
-                      <span style={{ fontWeight: 600, color: evt.event_type === 'FACE_MISMATCH' ? '#fca5a5' : '#f8fafc', fontSize: '0.875rem' }}>
-                        {evt.event_type.replace(/_/g, ' ')}
+                      <span style={{ fontWeight: 600, color: evt.event_type.includes('FACE') || evt.event_type.includes('BACKSIDE') ? '#fca5a5' : '#f8fafc', fontSize: '0.875rem' }}>
+                        {evt.event_type === 'BACKSIDE_OR_NO_VISIBLE_FACE'
+                          ? 'BACKSIDE OR NO VISIBLE FACE'
+                          : evt.event_type.replace(/_/g, ' ')}
                       </span>
                       {evt.snapshot_url && (
                         <div style={{ marginTop: '0.5rem' }}>

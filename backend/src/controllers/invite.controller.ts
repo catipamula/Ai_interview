@@ -1,4 +1,5 @@
 import { Request, Response } from 'express';
+import jwt from 'jsonwebtoken';
 import prisma from '../config/db';
 
 export const validateToken = async (req: Request, res: Response) => {
@@ -38,6 +39,10 @@ export const acceptTerms = async (req: Request, res: Response) => {
       return res.status(400).json({ error: 'Invalid or used token' });
     }
 
+    if (new Date() > invite.expires_at) {
+      return res.status(400).json({ error: 'Token expired' });
+    }
+
     await prisma.inviteToken.update({
       where: { id: invite.id },
       data: { status: 'used' }
@@ -46,12 +51,26 @@ export const acceptTerms = async (req: Request, res: Response) => {
     const session = await prisma.interviewSession.create({
       data: {
         candidate_id: invite.candidate_id,
-        status: 'in-progress',
-        started_at: new Date()
+        status: 'invited'
       }
     });
 
-    res.json({ message: 'Terms accepted, session created', sessionId: session.id });
+    const secret = process.env.JWT_SECRET || 'supersecret_for_local_dev';
+    const interviewAccessToken = jwt.sign(
+      {
+        purpose: 'candidate-interview',
+        sessionId: session.id,
+        candidateId: invite.candidate_id
+      },
+      secret,
+      { expiresIn: '2h' }
+    );
+
+    res.json({
+      message: 'Terms accepted, session created',
+      sessionId: session.id,
+      interviewAccessToken
+    });
   } catch (error) {
     res.status(500).json({ error: 'Failed to accept terms' });
   }

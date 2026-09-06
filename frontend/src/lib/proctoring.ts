@@ -1,7 +1,14 @@
 import * as cocoSsd from '@tensorflow-models/coco-ssd';
-import '@tensorflow/tfjs';
+import * as tf from '@tensorflow/tfjs-core';
+import '@tensorflow/tfjs-backend-webgl';
 
 export type ProctorEvent = 'NO_FACE' | 'MULTIPLE_FACES' | 'RESTRICTED_OBJECT' | 'TAB_SWITCH' | 'HEAVY_NOISE';
+export type LiveDetection = {
+  label: string;
+  score: number;
+  bbox: [number, number, number, number];
+  kind: 'person' | 'restricted';
+};
 
 /**
  * Text-To-Speech (TTS) Voice Alert helper.
@@ -27,21 +34,46 @@ export class ProctoringService {
   private model: cocoSsd.ObjectDetection | null = null;
   private intervalId: NodeJS.Timeout | null = null;
   private onEventFlagged: (event: ProctorEvent, snapshot?: string) => void;
+  private onDetections?: (detections: LiveDetection[]) => void;
   private currentVideoElement: HTMLVideoElement | null = null;
   private lastTabSwitchTime = 0;
+  private inferenceRunning = false;
+  private lastEventTimes = new Map<ProctorEvent, number>();
 
   // Audio proctoring fields
   private audioContext: AudioContext | null = null;
   private audioAnalyser: AnalyserNode | null = null;
   private audioStreamSource: MediaStreamAudioSourceNode | null = null;
 
-  constructor(onEventFlagged: (event: ProctorEvent, snapshot?: string) => void) {
+  constructor(
+    onEventFlagged: (event: ProctorEvent, snapshot?: string) => void,
+    onDetections?: (detections: LiveDetection[]) => void
+  ) {
     this.onEventFlagged = onEventFlagged;
+    this.onDetections = onDetections;
   }
 
-  async initialize() {
-    this.model = await cocoSsd.load();
-    console.log('Proctoring models loaded');
+  async initialize(): Promise<boolean> {
+    try {
+      await tf.setBackend('webgl');
+      await tf.ready();
+      // Serve the accurate model locally so proctoring does not fail when the
+      // interview browser cannot reach the external model host.
+      this.model = await cocoSsd.load({ base: 'mobilenet_v2', modelUrl: '/coco-model.json' });
+      console.log('[Proctoring] Local MobileNet v2 model loaded');
+      return true;
+    } catch (localError) {
+      console.warn('[Proctoring] Local model failed; trying lightweight fallback:', localError);
+      try {
+        this.model = await cocoSsd.load({ base: 'lite_mobilenet_v2', modelUrl: '/coco-lite-model.json' });
+        console.log('[Proctoring] Local lightweight fallback model loaded');
+        return true;
+      } catch (fallbackError) {
+        console.error('[Proctoring] Object models unavailable; other monitoring remains active:', fallbackError);
+        this.model = null;
+        return false;
+      }
+    }
   }
 
   startProctoring(videoElement: HTMLVideoElement, stream?: MediaStream) {
@@ -55,7 +87,7 @@ export class ProctoringService {
 
     if (stream && typeof window !== 'undefined') {
       try {
-        const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+        const AudioContextClass = window.AudioContext;
         this.audioContext = new AudioContextClass();
         this.audioAnalyser = this.audioContext.createAnalyser();
         this.audioStreamSource = this.audioContext.createMediaStreamSource(stream);
@@ -66,30 +98,40 @@ export class ProctoringService {
       }
     }
 
-    this.intervalId = setInterval(async () => {
+    const detect = async () => {
       // 1. Video detection
-      if (videoElement && videoElement.readyState === 4 && this.model) {
-        const predictions = await this.model.detect(videoElement);
+      if (videoElement && videoElement.readyState === 4 && this.model && !this.inferenceRunning) {
+        this.inferenceRunning = true;
+        try {
+          const predictions = await this.model.detect(videoElement, 30, 0.1);
+          const primaryPerson = predictions
+            .filter(p => p.class === 'person')
+            .sort((a, b) => b.score - a.score)[0];
+          const restrictedPredictions = predictions.filter(p => ['cell phone', 'remote', 'laptop', 'book'].includes(p.class));
+          const visibleDetections: LiveDetection[] = [
+            ...(primaryPerson ? [primaryPerson] : []),
+            ...restrictedPredictions
+          ]
+            .map(p => ({
+              label: ['cell phone', 'remote'].includes(p.class) ? 'Phone detected' : p.class,
+              score: p.score,
+              bbox: p.bbox as [number, number, number, number],
+              kind: p.class === 'person' ? 'person' : 'restricted'
+            }));
+          this.onDetections?.(visibleDetections);
         
-        let personCount = 0;
-        let restrictedObjectDetected = false;
-        
-        predictions.forEach(p => {
-          if (p.class === 'person') personCount++;
-          // COCO-SSD classes: 'cell phone', 'laptop', 'book'
-          if (['cell phone', 'laptop', 'book'].includes(p.class)) {
-            restrictedObjectDetected = true;
-          }
-        });
+          const personCount = primaryPerson ? 1 : 0;
+          const restrictedObjectDetected = restrictedPredictions.length > 0;
 
-        if (personCount === 0) {
-          this.triggerEvent('NO_FACE', videoElement);
-        } else if (personCount > 1) {
-          this.triggerEvent('MULTIPLE_FACES', videoElement);
-        }
+          if (personCount === 0) this.triggerEvent('NO_FACE', videoElement);
+          else if (personCount > 1) this.triggerEvent('MULTIPLE_FACES', videoElement);
 
-        if (restrictedObjectDetected) {
-          this.triggerEvent('RESTRICTED_OBJECT', videoElement);
+          if (restrictedObjectDetected) this.triggerEvent('RESTRICTED_OBJECT', videoElement);
+        } catch (error) {
+          console.error('[Proctoring] Live object detection failed:', error);
+          this.onDetections?.([]);
+        } finally {
+          this.inferenceRunning = false;
         }
       }
 
@@ -106,7 +148,10 @@ export class ProctoringService {
           this.triggerEvent('HEAVY_NOISE', videoElement);
         }
       }
-    }, 3000);
+    };
+
+    void detect();
+    this.intervalId = setInterval(detect, 1200);
   }
 
   private handleVisibilityChange = () => {
@@ -142,6 +187,9 @@ export class ProctoringService {
   };
 
   private triggerEvent(type: ProctorEvent, video?: HTMLVideoElement) {
+    const now = Date.now();
+    if (now - (this.lastEventTimes.get(type) || 0) < 5000) return;
+    this.lastEventTimes.set(type, now);
     let snapshot: string | undefined;
     try {
       if (video && video.readyState === 4) {
@@ -168,6 +216,6 @@ export class ProctoringService {
     try {
       this.audioStreamSource?.disconnect();
       this.audioContext?.close();
-    } catch (e) {}
+    } catch {}
   }
 }

@@ -14,6 +14,15 @@ interface Candidate {
   inviteTokens?: any[];
 }
 
+interface CandidateSession {
+  status: string;
+  result?: string | null;
+  overall_score?: number | null;
+}
+
+const isReportableSession = (session: CandidateSession) =>
+  ['completed', 'rejected', 'cancelled'].includes(session.status);
+
 const ROLES = ['General', 'Python', 'Java', 'Data Science'];
 
 export default function DashboardPage() {
@@ -43,7 +52,7 @@ export default function DashboardPage() {
       const total = data.length;
       let selected = 0, rejected = 0, pending = 0;
       data.forEach((c: Candidate) => {
-        const session = c.sessions?.[0];
+        const session = (c.sessions as CandidateSession[])?.find(isReportableSession) || c.sessions?.[0];
         if (session?.result === 'selected') selected++;
         else if (session?.result === 'rejected') rejected++;
         else pending++;
@@ -101,7 +110,10 @@ export default function DashboardPage() {
     try {
       const res = await fetch(`/api/candidates/${id}/grant-access`, {
         method: 'POST',
-        headers: { Authorization: `Bearer ${token}` }
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'X-Frontend-Origin': window.location.origin
+        }
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Failed to send invitation email');
@@ -244,7 +256,7 @@ export default function DashboardPage() {
             </thead>
             <tbody>
               {candidates.map(candidate => {
-                const session = candidate.sessions?.[0];
+                const reportSession = (candidate.sessions as CandidateSession[])?.find(isReportableSession);
                 const activeToken = candidate.inviteTokens?.[0];
                 const inviteLink = activeToken?.token ? `${window.location.origin}/interview/${activeToken.token}/terms` : null;
                 const isExpired = activeToken?.expires_at ? new Date() > new Date(activeToken.expires_at) : false;
@@ -282,9 +294,9 @@ export default function DashboardPage() {
                     <td><span className="role-badge">{candidate.role}</span></td>
                     <td>{getStatusBadge(candidate)}</td>
                     <td>
-                      {session?.overall_score !== null && session?.overall_score !== undefined ? (
-                        <span style={{ fontWeight: 600, color: session.overall_score >= 70 ? '#10b981' : session.overall_score >= 50 ? '#f59e0b' : '#ef4444' }}>
-                          {Math.round(session.overall_score)}%
+                      {reportSession?.overall_score !== null && reportSession?.overall_score !== undefined ? (
+                        <span style={{ fontWeight: 600, color: reportSession.overall_score >= 70 ? '#10b981' : reportSession.overall_score >= 50 ? '#f59e0b' : '#ef4444' }}>
+                          {Math.round(reportSession.overall_score)}%
                         </span>
                       ) : (
                         <span style={{ color: '#64748b' }}>-</span>
@@ -292,12 +304,12 @@ export default function DashboardPage() {
                     </td>
                     <td style={{ textAlign: 'right' }}>
                       <div style={{ display: 'flex', gap: '0.5rem', justifyContent: 'flex-end', flexWrap: 'wrap' }}>
-                        {session?.status === 'completed' || session?.status === 'rejected' || session?.status === 'cancelled' ? (
+                        {reportSession ? (
                           <>
                             <button onClick={() => router.push(`/candidates/${candidate.id}/report`)} className="btn-secondary btn-sm">
                               View Report
                             </button>
-                            {!session?.result && (
+                            {!reportSession.result && (
                               <>
                                 <button onClick={() => router.push(`/candidates/${candidate.id}/report`)} className="btn-primary btn-sm" style={{ backgroundColor: 'rgba(16, 185, 129, 0.3)' }}>
                                   Select

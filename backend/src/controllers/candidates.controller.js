@@ -35,7 +35,7 @@ const listCandidates = async (req, res) => {
         const candidates = await db_1.default.candidate.findMany({
             where: { organizer_id },
             include: {
-                sessions: true,
+                sessions: { orderBy: { createdAt: 'desc' } },
                 inviteTokens: { orderBy: { createdAt: 'desc' } }
             }
         });
@@ -58,7 +58,9 @@ const grantAccess = async (req, res) => {
         if (!candidate)
             return res.status(404).json({ error: 'Candidate not found' });
         (0, email_service_1.assertEmailConfiguration)();
-        const frontendUrl = process.env.FRONTEND_URL;
+        const requestedFrontendOrigin = req.get('X-Frontend-Origin');
+        const configuredFrontendUrl = process.env.PUBLIC_FRONTEND_URL || process.env.FRONTEND_URL;
+        const frontendUrl = requestedFrontendOrigin || configuredFrontendUrl;
         if (!frontendUrl)
             throw new Error('FRONTEND_URL is not configured');
         const token = crypto_1.default.randomBytes(32).toString('hex');
@@ -104,6 +106,7 @@ const getReport = async (req, res) => {
             where: { id, organizer_id: organizer_id },
             include: {
                 sessions: {
+                    orderBy: { createdAt: 'desc' },
                     include: {
                         answers: { include: { question: true } },
                         proctorEvents: true

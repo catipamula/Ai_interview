@@ -3,7 +3,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.sendInterviewResultEmail = exports.sendInterviewInvitationEmail = exports.assertEmailConfiguration = void 0;
+exports.sendInterviewResultEmail = exports.sendPasswordResetEmail = exports.sendInterviewInvitationEmail = exports.assertEmailConfiguration = void 0;
 const nodemailer_1 = __importDefault(require("nodemailer"));
 const required = (name) => {
     const value = process.env[name];
@@ -52,6 +52,13 @@ const sendInterviewInvitationEmail = (candidate, inviteLink) => send(candidate.e
       <p style="color: #999; font-size: 12px;">PyProctor AI - Automated Technical Interview Platform</p>
     </div>`);
 exports.sendInterviewInvitationEmail = sendInterviewInvitationEmail;
+const sendPasswordResetEmail = (email, resetLink) => send(email, 'Reset your PyProctor AI password', `<div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; color: #333;">
+      <h2 style="color: #3b82f6;">PyProctor AI</h2>
+      <p>We received a request to reset your organizer account password.</p>
+      <p><a href="${resetLink}" style="display: inline-block; background: #3b82f6; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; font-weight: 600;">Reset Password</a></p>
+      <p style="color: #666; font-size: 14px;">This link expires in 1 hour and can only be used once. If you did not request this, you can ignore this email.</p>
+    </div>`);
+exports.sendPasswordResetEmail = sendPasswordResetEmail;
 const sendInterviewResultEmail = (candidate, score, correctCount, passed, rejectionReason) => {
     const subject = passed
         ? 'Congratulations - You passed your PyProctor AI interview!'
@@ -75,6 +82,9 @@ const sendInterviewResultEmail = (candidate, score, correctCount, passed, reject
       </div>
       <p>Hi ${candidate.name},</p>
       <p>${message}</p>
+      <div style="background: #ecfdf5; border-left: 4px solid #10b981; padding: 14px 16px; margin: 16px 0; border-radius: 4px; color: #065f46; font-weight: 600;">
+        Face verification passed successfully.
+      </div>
       ${reasonBlock}
       <div style="background: ${scoreBg}; padding: 20px; border-radius: 8px; margin: 20px 0; text-align: center;">
         <p style="margin: 0; color: #666; font-size: 14px;">Your Interview Score</p>

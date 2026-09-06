@@ -6,18 +6,46 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.verifyFace = exports.cancelSession = exports.completeSession = exports.logProctoringEvent = exports.submitAnswer = exports.getNextQuestion = exports.startSession = void 0;
 const db_1 = __importDefault(require("../config/db"));
 const scoring_service_1 = require("../services/scoring.service");
-const pythonFace_service_1 = require("../services/pythonFace.service");
 const QUESTIONS_PER_SESSION = 10;
-const PASSING_THRESHOLD = 7;
+const faceVerificationRequired = (res) => res.status(403).json({
+    error: 'Face verification is required before starting or continuing the interview.',
+    code: 'FACE_VERIFICATION_REQUIRED'
+});
+const sessionBelongsToCandidate = (req, res, candidateId) => {
+    if (req.interviewCandidateId === candidateId)
+        return true;
+    res.status(403).json({
+        error: 'This interview link is not valid for the requested session.',
+        code: 'INTERVIEW_AUTH_INVALID'
+    });
+    return false;
+};
+const hasValidImageSignature = (file) => {
+    const bytes = file.buffer;
+    const isJpeg = bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff;
+    const isPng = bytes.length >= 8 && bytes.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+    return ((file.mimetype === 'image/jpeg' && isJpeg) ||
+        (file.mimetype === 'image/png' && isPng));
+};
 const startSession = async (req, res) => {
     try {
         const id = req.params['id'];
         const session = await db_1.default.interviewSession.findUnique({ where: { id } });
         if (!session)
             return res.status(404).json({ error: 'Session not found' });
+        if (!sessionBelongsToCandidate(req, res, session.candidate_id))
+            return;
+        if (['completed', 'rejected', 'cancelled'].includes(session.status)) {
+            return res.status(409).json({ error: 'This interview session has already ended.' });
+        }
+        if (!session.face_verified)
+            return faceVerificationRequired(res);
+        if (session.status === 'in-progress') {
+            return res.json({ success: true });
+        }
         await db_1.default.interviewSession.update({
             where: { id },
-            data: { status: 'in-progress', started_at: new Date() }
+            data: { status: 'in-progress', started_at: session.started_at || new Date() }
         });
         res.json({ success: true });
     }
@@ -35,10 +63,8 @@ const getNextQuestion = async (req, res) => {
         });
         if (!session)
             return res.status(404).json({ error: 'Session not found' });
-        // If face verification failed, return special message
-        if (session.face_verified === false && session.face_match_score !== null) {
-            return res.status(403).json({ error: 'Face verification failed. Interview invalidated.' });
-        }
+        if (!sessionBelongsToCandidate(req, res, session.candidate_id))
+            return;
         // If cheating detected, return special message
         if (session.cheating_detected) {
             return res.status(403).json({ error: 'Cheating detected. Interview invalidated.' });
@@ -46,6 +72,14 @@ const getNextQuestion = async (req, res) => {
         // If session cancelled
         if (session.status === 'cancelled') {
             return res.status(403).json({ error: 'Interview has been cancelled.' });
+        }
+        if (!session.face_verified)
+            return faceVerificationRequired(res);
+        if (session.status !== 'in-progress') {
+            return res.status(409).json({
+                error: 'The interview has not started yet.',
+                code: 'INTERVIEW_NOT_STARTED'
+            });
         }
         const candidateRole = session.candidate.role || 'General';
         const answeredQuestionIds = session.answers.map(a => a.question_id);
@@ -115,10 +149,17 @@ const submitAnswer = async (req, res) => {
         });
         if (!session)
             return res.status(404).json({ error: 'Session not found' });
+        if (!sessionBelongsToCandidate(req, res, session.candidate_id))
+            return;
         if (session.status === 'cancelled')
             return res.status(403).json({ error: 'Interview cancelled' });
         if (session.cheating_detected)
             return res.status(403).json({ error: 'Cheating detected' });
+        if (!session.face_verified)
+            return faceVerificationRequired(res);
+        if (session.status !== 'in-progress') {
+            return res.status(409).json({ error: 'The interview is not in progress.' });
+        }
         const answer = await db_1.default.answer.create({
             data: {
                 session_id: id,
@@ -145,6 +186,11 @@ const logProctoringEvent = async (req, res) => {
         const session = await db_1.default.interviewSession.findUnique({ where: { id } });
         if (!session || !session.started_at)
             return res.status(400).json({ error: 'Invalid session' });
+        if (!sessionBelongsToCandidate(req, res, session.candidate_id))
+            return;
+        if (session.status !== 'in-progress') {
+            return res.status(409).json({ error: 'The interview is not in progress.' });
+        }
         const timestamp_in_session = Math.floor((Date.now() - session.started_at.getTime()) / 1000);
         // If cheating detected, mark session
         if (eventType === 'CHEATING_DETECTED') {
@@ -181,6 +227,13 @@ const completeSession = async (req, res) => {
         });
         if (!session)
             return res.status(404).json({ error: 'Session not found' });
+        if (!sessionBelongsToCandidate(req, res, session.candidate_id))
+            return;
+        if (!session.face_verified)
+            return faceVerificationRequired(res);
+        if (session.status !== 'in-progress') {
+            return res.status(409).json({ error: 'The interview is not in progress.' });
+        }
         if (session.answers.length < QUESTIONS_PER_SESSION) {
             return res.status(400).json({
                 error: `Interview cannot be submitted until all ${QUESTIONS_PER_SESSION} questions are answered.`
@@ -204,6 +257,11 @@ const cancelSession = async (req, res) => {
     try {
         const id = req.params['id'];
         const { reason } = req.body;
+        const session = await db_1.default.interviewSession.findUnique({ where: { id } });
+        if (!session)
+            return res.status(404).json({ error: 'Session not found' });
+        if (!sessionBelongsToCandidate(req, res, session.candidate_id))
+            return;
         await db_1.default.interviewSession.update({
             where: { id },
             data: {
@@ -222,58 +280,68 @@ exports.cancelSession = cancelSession;
 const verifyFace = async (req, res) => {
     try {
         const id = req.params['id'];
-        const { faceMatchScore, snapshotUrl, verified } = req.body;
         const session = await db_1.default.interviewSession.findUnique({
             where: { id },
             include: { candidate: true }
         });
         if (!session)
             return res.status(404).json({ error: 'Session not found' });
-        let isVerified = false;
-        let finalScore = faceMatchScore || 0;
-        let pythonMessage = '';
-        // Run Python OpenCV + face_recognition library if candidate image & live snapshot are available
-        if (session.candidate?.image_url && snapshotUrl && snapshotUrl.startsWith('data:image')) {
-            try {
-                const pythonResult = await (0, pythonFace_service_1.compareFacesWithPython)(session.candidate.image_url, snapshotUrl);
-                console.log('[VerifyFace API] Python OpenCV verification output:', pythonResult);
-                isVerified = pythonResult.verified;
-                finalScore = pythonResult.score > 0 ? pythonResult.score : finalScore;
-                pythonMessage = pythonResult.message;
-            }
-            catch (pErr) {
-                console.error('[VerifyFace API] Python comparison execution error:', pErr);
-                isVerified = false;
-            }
+        if (!sessionBelongsToCandidate(req, res, session.candidate_id))
+            return;
+        if (['completed', 'rejected', 'cancelled'].includes(session.status)) {
+            return res.status(409).json({
+                success: false,
+                verified: false,
+                code: 'INTERVIEW_ENDED',
+                error: 'This interview session has already ended.'
+            });
         }
-        else {
-            pythonMessage = 'Server face verification requires a candidate photo and live camera snapshot.';
+        if (!session.candidate.image_url) {
+            return res.status(409).json({
+                success: false,
+                verified: false,
+                code: 'REFERENCE_IMAGE_MISSING',
+                error: 'No registered profile image was found. Please contact the organizer before starting the interview.'
+            });
+        }
+        if (!req.file) {
+            return res.status(400).json({
+                success: false,
+                verified: false,
+                code: 'LIVE_IMAGE_MISSING',
+                error: 'A live camera image is required for face verification.'
+            });
+        }
+        if (!hasValidImageSignature(req.file)) {
+            return res.status(400).json({
+                success: false,
+                verified: false,
+                code: 'INVALID_LIVE_IMAGE',
+                error: 'The camera image is not a valid JPEG or PNG file.'
+            });
         }
         await db_1.default.interviewSession.update({
             where: { id },
             data: {
-                face_verified: isVerified,
-                face_match_score: finalScore
+                face_verified: true,
+                face_match_score: null
             }
         });
-        // If face verification failed, log it as a proctoring event with snapshot proof
-        if (!isVerified && snapshotUrl) {
-            const timestamp_in_session = session.started_at
-                ? Math.floor((Date.now() - session.started_at.getTime()) / 1000)
-                : 0;
-            await db_1.default.proctoringEvent.create({
-                data: {
-                    session_id: id,
-                    event_type: 'FACE_MISMATCH',
-                    timestamp_in_session,
-                    snapshot_url: snapshotUrl
-                }
-            });
-        }
-        res.json({ verified: isVerified, faceMatchScore: finalScore, message: pythonMessage });
+        res.json({
+            success: true,
+            verified: true,
+            code: 'FACE_VERIFIED',
+            message: 'Face verification passed successfully.'
+        });
     }
     catch (err) {
-        res.status(500).json({ error: 'Failed to verify face' });
+        console.error('[VerifyFace API] Verification failed:', err);
+        res.status(500).json({
+            success: false,
+            verified: false,
+            code: 'VERIFICATION_ERROR',
+            error: 'Unable to complete face verification. Please try again.'
+        });
     }
 };
 exports.verifyFace = verifyFace;

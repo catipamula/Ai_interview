@@ -19,6 +19,15 @@ export default function TermsPage({
   const [submitting, setSubmitting] = useState(false);
 
   useEffect(() => {
+    const storedInviteToken = localStorage.getItem('interviewInviteToken');
+    if (storedInviteToken !== token) {
+      localStorage.removeItem('sessionId');
+      localStorage.removeItem('interviewAccessToken');
+      sessionStorage.removeItem('interviewAccessToken');
+      localStorage.removeItem('candidateImage');
+      localStorage.setItem('interviewInviteToken', token);
+    }
+
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 15000); // 15s timeout
 
@@ -29,7 +38,11 @@ export default function TermsPage({
       })
       .then(data => {
         if (data.error) setError(data.error);
-        else setCandidateName(data.candidateName);
+        else {
+          setCandidateName(data.candidateName);
+          if (data.candidateImage) localStorage.setItem('candidateImage', data.candidateImage);
+          else localStorage.removeItem('candidateImage');
+        }
         setLoading(false);
       })
       .catch((err) => {
@@ -52,11 +65,16 @@ export default function TermsPage({
       });
       const data = await res.json();
       if (data.error) throw new Error(data.error);
+      if (!data.sessionId || !data.interviewAccessToken) {
+        throw new Error('The interview session could not be created. Please try again.');
+      }
 
       localStorage.setItem('sessionId', data.sessionId);
+      sessionStorage.setItem('interviewAccessToken', data.interviewAccessToken);
+      localStorage.removeItem('interviewAccessToken');
       router.push(`/interview/${token}/device-check`);
-    } catch (err: any) {
-      alert(err.message || 'Failed to accept terms. Please try again.');
+    } catch (err) {
+      alert(err instanceof Error ? err.message : 'Failed to accept terms. Please try again.');
       setSubmitting(false);
     }
   };

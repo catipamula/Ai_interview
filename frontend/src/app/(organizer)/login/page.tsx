@@ -8,6 +8,9 @@ export default function LoginPage() {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
+  const [showForgotPassword, setShowForgotPassword] = useState(false);
+  const [resetMessage, setResetMessage] = useState('');
+  const [resetLoading, setResetLoading] = useState(false);
 
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -27,8 +30,30 @@ export default function LoginPage() {
       const data = await res.json();
       localStorage.setItem('organizerToken', data.token);
       router.push('/dashboard');
-    } catch (err: any) {
-      setError(err.message);
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : 'Invalid credentials');
+    }
+  };
+
+  const handleForgotPassword = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError('');
+    setResetMessage('');
+    setResetLoading(true);
+
+    try {
+      const res = await fetch('/api/auth/forgot-password', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Unable to send reset email');
+      setResetMessage(data.message);
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : 'Unable to send reset email');
+    } finally {
+      setResetLoading(false);
     }
   };
 
@@ -41,8 +66,9 @@ export default function LoginPage() {
         <p style={{ color: '#94a3b8', textAlign: 'center', marginBottom: '2rem' }}>Sign in to manage candidates</p>
 
         {error && <div style={{ color: 'var(--error)', marginBottom: '1rem', textAlign: 'center', fontSize: '0.875rem' }}>{error}</div>}
+        {resetMessage && <div style={{ color: '#22c55e', marginBottom: '1rem', textAlign: 'center', fontSize: '0.875rem' }}>{resetMessage}</div>}
 
-        <form onSubmit={handleLogin} style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem' }}>
+        <form onSubmit={showForgotPassword ? handleForgotPassword : handleLogin} style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem' }}>
           <div>
             <label style={{ display: 'block', marginBottom: '0.5rem', fontSize: '0.875rem', color: '#cbd5e1' }}>Email address</label>
             <input
@@ -54,7 +80,7 @@ export default function LoginPage() {
               placeholder="organizer@company.com"
             />
           </div>
-          <div>
+          {!showForgotPassword && <div>
             <label style={{ display: 'block', marginBottom: '0.5rem', fontSize: '0.875rem', color: '#cbd5e1' }}>Password</label>
             <input
               type="password"
@@ -64,15 +90,23 @@ export default function LoginPage() {
               onChange={(e) => setPassword(e.target.value)}
               placeholder="••••••••"
             />
-          </div>
-          <button type="submit" className="btn-primary" style={{ marginTop: '0.5rem' }}>
-            Sign In
+          </div>}
+          <button type="submit" className="btn-primary" style={{ marginTop: '0.5rem' }} disabled={resetLoading}>
+            {showForgotPassword ? (resetLoading ? 'Sending...' : 'Send Reset Link') : 'Sign In'}
           </button>
         </form>
 
-        <div style={{ marginTop: '1.5rem', textAlign: 'center', fontSize: '0.875rem', color: '#cbd5e1' }}>
-          Don't have an account? <a href="/register" style={{ color: 'var(--primary)', textDecoration: 'underline' }}>Register here</a>
-        </div>
+        <button
+          type="button"
+          onClick={() => { setShowForgotPassword(!showForgotPassword); setError(''); setResetMessage(''); }}
+          style={{ display: 'block', margin: '1rem auto 0', background: 'none', border: 0, color: 'var(--primary)', textDecoration: 'underline', cursor: 'pointer' }}
+        >
+          {showForgotPassword ? 'Back to sign in' : 'Forgot password?'}
+        </button>
+
+        {!showForgotPassword && <div style={{ marginTop: '1.5rem', textAlign: 'center', fontSize: '0.875rem', color: '#cbd5e1' }}>
+          Don&apos;t have an account? <a href="/register" style={{ color: 'var(--primary)', textDecoration: 'underline' }}>Register here</a>
+        </div>}
       </div>
     </div>
   );

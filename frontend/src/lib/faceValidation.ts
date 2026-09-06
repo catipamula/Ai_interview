@@ -14,6 +14,7 @@ const MODEL_URL = 'https://justadudewhohacks.github.io/face-api.js/models';
 export const FACE_MATCH_THRESHOLD = 0.25; // Euclidean distance <= 0.75
 const STRICT_THRESHOLD = 0.60;
 const MIN_FACE_SIZE = 25;
+export const MIN_FACE_AREA_RATIO = 0.05;
 
 export interface FaceValidationResult {
   verified: boolean;
@@ -185,7 +186,7 @@ class FaceValidationService {
             .withFaceLandmarks()
             .withFaceDescriptor();
           if (detection) break;
-        } catch (e) {
+        } catch {
           // ignore error and try next size
         }
       }
@@ -220,7 +221,7 @@ class FaceValidationService {
   /**
    * Extract descriptor for Live Webcam frame.
    */
-  async extractLiveDescriptor(input: HTMLImageElement | HTMLCanvasElement): Promise<{ descriptor: Float32Array; score: number } | null> {
+  async extractLiveDescriptor(input: HTMLImageElement | HTMLCanvasElement): Promise<{ descriptor: Float32Array; score: number; faceAreaRatio: number; bbox: [number, number, number, number] } | null> {
     let detection = null;
 
     if (this.ssdLoaded) {
@@ -229,7 +230,7 @@ class FaceValidationService {
           .detectSingleFace(input, new faceapi.SsdMobilenetv1Options({ minConfidence: 0.25 }))
           .withFaceLandmarks()
           .withFaceDescriptor();
-      } catch (e) {}
+      } catch {}
     }
 
     if (!detection) {
@@ -243,6 +244,9 @@ class FaceValidationService {
 
     const box = detection.detection.box;
     if (box.width < MIN_FACE_SIZE || box.height < MIN_FACE_SIZE) return null;
+    const inputArea = input.width * input.height;
+    const faceAreaRatio = inputArea > 0 ? (box.width * box.height) / inputArea : 0;
+    if (faceAreaRatio < MIN_FACE_AREA_RATIO) return null;
 
     const croppedCanvas = this.cropFaceCanvas(input, box);
     const croppedDetection = await faceapi
@@ -251,11 +255,11 @@ class FaceValidationService {
       .withFaceDescriptor();
 
     if (croppedDetection) {
-      return { descriptor: croppedDetection.descriptor, score: detection.detection.score };
+      return { descriptor: croppedDetection.descriptor, score: detection.detection.score, faceAreaRatio, bbox: [box.x, box.y, box.width, box.height] };
     }
 
     if (detection.descriptor) {
-      return { descriptor: detection.descriptor, score: detection.detection.score };
+      return { descriptor: detection.descriptor, score: detection.detection.score, faceAreaRatio, bbox: [box.x, box.y, box.width, box.height] };
     }
 
     return null;
@@ -382,7 +386,7 @@ class FaceValidationService {
 
       // LENIENT DECISION: Pass if best score meets threshold (distance <= 0.70)
       // or if both faces were clearly detected (distance <= 0.72)
-      const isMatch = bestSingleScore >= threshold || bestDistance <= 0.72 || (debug.referenceFaceDetected && successfulAttempts > 0);
+      const isMatch = bestSingleScore >= threshold;
       const confidencePercent = Math.round(bestSingleScore * 100);
 
       let message: string;
@@ -419,38 +423,38 @@ class FaceValidationService {
   async quickCheck(
     video: HTMLVideoElement,
     candidateImageUrl: string
-  ): Promise<{ match: boolean; score: number; snapshot: string | null; distance: number }> {
+  ): Promise<{ match: boolean; score: number; snapshot: string | null; distance: number; faceAreaRatio: number; bbox: [number, number, number, number] | null }> {
     if (!this.modelsLoaded || !video || video.readyState < 2) {
-      return { match: true, score: 1, snapshot: null, distance: 0 };
+      return { match: true, score: 1, snapshot: null, distance: 0, faceAreaRatio: 1, bbox: null };
     }
 
     try {
       const snapshot = this.captureSnapshot(video);
-      if (!snapshot) return { match: true, score: 1, snapshot: null, distance: 0 };
-
-      const candidateDescriptor = await this.extractCandidateDescriptor(candidateImageUrl);
-      if (!candidateDescriptor) {
-        return { match: true, score: 1, snapshot, distance: 0 };
-      }
+      if (!snapshot) return { match: true, score: 1, snapshot: null, distance: 0, faceAreaRatio: 1, bbox: null };
 
       const liveImg = await faceapi.fetchImage(snapshot);
       const liveResult = await this.extractLiveDescriptor(liveImg);
 
       if (!liveResult) {
         // No face in frame (e.g. temporary glance away)
-        return { match: false, score: 0, snapshot, distance: 1 };
+        return { match: false, score: 0, snapshot, distance: 1, faceAreaRatio: 0, bbox: null };
+      }
+
+      const candidateDescriptor = await this.extractCandidateDescriptor(candidateImageUrl);
+      if (!candidateDescriptor) {
+        return { match: true, score: 1, snapshot, distance: 0, faceAreaRatio: liveResult.faceAreaRatio, bbox: liveResult.bbox };
       }
 
       const distance = faceapi.euclideanDistance(candidateDescriptor, liveResult.descriptor);
       const score = Math.max(0, 1 - distance);
 
       // Match if score >= FACE_MATCH_THRESHOLD or distance <= 0.72
-      const match = score >= FACE_MATCH_THRESHOLD || distance <= 0.72;
+      const match = score >= FACE_MATCH_THRESHOLD && liveResult.faceAreaRatio >= MIN_FACE_AREA_RATIO;
 
-      return { match, score, snapshot, distance };
+      return { match, score, snapshot, distance, faceAreaRatio: liveResult.faceAreaRatio, bbox: liveResult.bbox };
     } catch (err) {
       console.error('[FaceValidation] Quick check error:', err);
-      return { match: true, score: 1, snapshot: null, distance: 0 };
+      return { match: true, score: 1, snapshot: null, distance: 0, faceAreaRatio: 1, bbox: null };
     }
   }
 }

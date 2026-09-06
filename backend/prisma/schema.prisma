@@ -14,8 +14,21 @@ model Organizer {
   password_hash String
   org_name      String?
   candidates    Candidate[]
+  passwordResetTokens PasswordResetToken[]
   createdAt     DateTime  @default(now())
   updatedAt     DateTime  @updatedAt
+}
+
+model PasswordResetToken {
+  id           String    @id @default(uuid())
+  organizer_id String
+  organizer    Organizer @relation(fields: [organizer_id], references: [id], onDelete: Cascade)
+  token_hash   String    @unique
+  expires_at   DateTime
+  used_at      DateTime?
+  createdAt    DateTime  @default(now())
+
+  @@index([organizer_id, expires_at])
 }
 
 model Candidate {

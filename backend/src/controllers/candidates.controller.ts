@@ -34,7 +34,7 @@ export const listCandidates = async (req: AuthRequest, res: Response) => {
     const candidates = await prisma.candidate.findMany({
       where: { organizer_id },
       include: {
-        sessions: true,
+        sessions: { orderBy: { createdAt: 'desc' } },
         inviteTokens: { orderBy: { createdAt: 'desc' } }
       }
     });
@@ -58,7 +58,9 @@ export const grantAccess = async (req: AuthRequest, res: Response) => {
 
     assertEmailConfiguration();
 
-    const frontendUrl = process.env.FRONTEND_URL;
+    const requestedFrontendOrigin = req.get('X-Frontend-Origin');
+    const configuredFrontendUrl = process.env.PUBLIC_FRONTEND_URL || process.env.FRONTEND_URL;
+    const frontendUrl = requestedFrontendOrigin || configuredFrontendUrl;
     if (!frontendUrl) throw new Error('FRONTEND_URL is not configured');
 
     const token = crypto.randomBytes(32).toString('hex');
@@ -106,6 +108,7 @@ export const getReport = async (req: AuthRequest, res: Response) => {
       where: { id, organizer_id: organizer_id as string },
       include: {
         sessions: {
+          orderBy: { createdAt: 'desc' },
           include: {
             answers: { include: { question: true } },
             proctorEvents: true

@@ -1,108 +1,226 @@
 import path from 'path';
 import fs from 'fs';
-import { execFile } from 'child_process';
+import { spawn, type ChildProcessWithoutNullStreams } from 'child_process';
 
 export interface PythonFaceResult {
+  success: boolean;
   verified: boolean;
-  score: number;
-  distance: number;
+  code: string;
+  distance: number | null;
+  threshold: number;
   message: string;
-  ref_face_found: boolean;
-  live_face_found: boolean;
+  reference_face_count: number;
+  live_face_count: number;
+}
+
+const PYTHON_TIMEOUT_MS = 30_000;
+const MAX_PROCESS_OUTPUT_BYTES = 1024 * 1024;
+const FACE_DISTANCE_TOLERANCE = 0.6;
+
+function failureResult(code: string, message: string): PythonFaceResult {
+  return {
+    success: false,
+    verified: false,
+    code,
+    distance: null,
+    threshold: FACE_DISTANCE_TOLERANCE,
+    message,
+    reference_face_count: 0,
+    live_face_count: 0
+  };
+}
+
+function findBackendRoot(): string | null {
+  const candidates = [
+    path.resolve(__dirname, '../..'),
+    path.resolve(process.cwd())
+  ];
+
+  return candidates.find(candidate =>
+    fs.existsSync(path.join(candidate, 'src', 'services', 'compare_faces.py'))
+  ) || null;
+}
+
+function resolveReferenceImagePath(backendRoot: string, referenceImageUrl: string): string | null {
+  const prefix = '/uploads/candidates/';
+  if (!referenceImageUrl.startsWith(prefix)) return null;
+
+  const filename = referenceImageUrl.slice(prefix.length);
+  if (!filename || filename !== path.basename(filename)) return null;
+
+  const uploadRoot = path.resolve(backendRoot, 'public', 'uploads', 'candidates');
+  const resolvedPath = path.resolve(uploadRoot, filename);
+  if (!resolvedPath.startsWith(`${uploadRoot}${path.sep}`)) return null;
+
+  try {
+    const stat = fs.statSync(resolvedPath);
+    if (!stat.isFile() || stat.size === 0 || stat.size > 5 * 1024 * 1024) return null;
+  } catch {
+    return null;
+  }
+
+  return resolvedPath;
+}
+
+function findPythonExecutable(projectRoot: string): string {
+  const venvPythonWindows = path.join(projectRoot, 'face-test-python', 'venv', 'Scripts', 'python.exe');
+  const venvPythonUnix = path.join(projectRoot, 'face-test-python', 'venv', 'bin', 'python');
+
+  if (fs.existsSync(venvPythonWindows)) return venvPythonWindows;
+  if (fs.existsSync(venvPythonUnix)) return venvPythonUnix;
+  return 'python';
+}
+
+function isPythonFaceResult(value: unknown): value is PythonFaceResult {
+  if (!value || typeof value !== 'object') return false;
+  const result = value as Partial<PythonFaceResult>;
+  return (
+    typeof result.success === 'boolean' &&
+    typeof result.verified === 'boolean' &&
+    typeof result.code === 'string' &&
+    (typeof result.distance === 'number' || result.distance === null) &&
+    typeof result.threshold === 'number' &&
+    typeof result.message === 'string' &&
+    typeof result.reference_face_count === 'number' &&
+    typeof result.live_face_count === 'number'
+  );
 }
 
 export async function compareFacesWithPython(
   referenceImageUrl: string,
-  liveSnapshotDataUrl: string
+  liveImageBuffer: Buffer
 ): Promise<PythonFaceResult> {
-  return new Promise((resolve) => {
+  const backendRoot = findBackendRoot();
+  if (!backendRoot) {
+    return failureResult('SERVICE_UNAVAILABLE', 'Unable to complete face verification. Please try again.');
+  }
+
+  const referenceImagePath = resolveReferenceImagePath(backendRoot, referenceImageUrl);
+  if (!referenceImagePath) {
+    return failureResult(
+      'INVALID_REFERENCE_IMAGE',
+      'No registered profile image was found. Please contact the organizer.'
+    );
+  }
+
+  if (!liveImageBuffer.length || liveImageBuffer.length > 2 * 1024 * 1024) {
+    return failureResult('INVALID_LIVE_IMAGE', 'The camera image is invalid. Please try again.');
+  }
+
+  const projectRoot = path.resolve(backendRoot, '..');
+  const pythonExecutable = findPythonExecutable(projectRoot);
+  const scriptPath = path.join(backendRoot, 'src', 'services', 'compare_faces.py');
+
+  return new Promise(resolve => {
+    let settled = false;
+    let stdout = '';
+    let stderr = '';
+    let timeout: NodeJS.Timeout | undefined;
+
+    const finish = (result: PythonFaceResult) => {
+      if (settled) return;
+      settled = true;
+      if (timeout) clearTimeout(timeout);
+      resolve(result);
+    };
+
+    let child: ChildProcessWithoutNullStreams;
     try {
-      // Find python executable in face-test-python/venv
-      const rootDir = path.resolve(__dirname, '../../..');
-      const venvPythonWin = path.join(rootDir, 'face-test-python', 'venv', 'Scripts', 'python.exe');
-      const venvPythonLinux = path.join(rootDir, 'face-test-python', 'venv', 'bin', 'python');
-
-      let pythonExec = 'python';
-      if (fs.existsSync(venvPythonWin)) {
-        pythonExec = venvPythonWin;
-      } else if (fs.existsSync(venvPythonLinux)) {
-        pythonExec = venvPythonLinux;
-      }
-
-      const scriptPath = path.join(__dirname, 'compare_faces.py');
-
-      // Resolve reference image path on disk
-      let refPathOnDisk = referenceImageUrl;
-      if (referenceImageUrl.startsWith('/uploads/')) {
-        refPathOnDisk = path.join(__dirname, '../../public', referenceImageUrl);
-      } else if (referenceImageUrl.startsWith('http')) {
-        // If external URL, pass as is
-        refPathOnDisk = referenceImageUrl;
-      }
-
-      console.log('[PythonFaceService] Executing OpenCV + face_recognition python:', {
-        pythonExec,
-        scriptPath,
-        refPathOnDisk
-      });
-
-      const args = [
-        scriptPath,
-        '--ref', refPathOnDisk,
-        '--live', liveSnapshotDataUrl,
-        '--tolerance', '0.75'
-      ];
-
-      execFile(pythonExec, args, { maxBuffer: 10 * 1024 * 1024 }, (error, stdout, stderr) => {
-        if (error) {
-          console.warn('[PythonFaceService] Python process error:', error.message, stderr);
-          // Fail closed when the server verifier cannot run.
-          return resolve({
-            verified: false,
-            score: 0,
-            distance: 1,
-            message: 'Python face verification failed to run.',
-            ref_face_found: false,
-            live_face_found: false
-          });
+      child = spawn(
+        pythonExecutable,
+        [
+          scriptPath,
+          '--ref', referenceImagePath,
+          '--live-stdin',
+          '--tolerance', FACE_DISTANCE_TOLERANCE.toString()
+        ],
+        {
+          cwd: backendRoot,
+          windowsHide: true,
+          stdio: ['pipe', 'pipe', 'pipe']
         }
-
-        try {
-          // Find the line that is a valid JSON (starts with '{' and ends with '}')
-          const lines = stdout.trim().split('\n');
-          let jsonLine = '{}';
-          for (let i = lines.length - 1; i >= 0; i--) {
-            const line = lines[i]?.trim() || '';
-            if (line.startsWith('{') && line.endsWith('}')) {
-              jsonLine = line;
-              break;
-            }
-          }
-          const result: PythonFaceResult = JSON.parse(jsonLine);
-          console.log('[PythonFaceService] Python OpenCV result:', result);
-          resolve(result);
-        } catch (parseErr) {
-          console.error('[PythonFaceService] Failed to parse JSON stdout:', stdout);
-          resolve({
-            verified: false,
-            score: 0,
-            distance: 1,
-            message: 'Python face verification returned an invalid result.',
-            ref_face_found: false,
-            live_face_found: false
-          });
-        }
-      });
-    } catch (err) {
-      console.error('[PythonFaceService] Unexpected error:', err);
-      resolve({
-        verified: false,
-        score: 0,
-        distance: 1,
-        message: 'Python face verification failed unexpectedly.',
-        ref_face_found: false,
-        live_face_found: false
-      });
+      ) as ChildProcessWithoutNullStreams;
+    } catch (error) {
+      console.error('[PythonFaceService] Failed to start verifier:', error);
+      finish(failureResult(
+        'SERVICE_UNAVAILABLE',
+        'Face verification service is unavailable. Please try again.'
+      ));
+      return;
     }
+
+    timeout = setTimeout(() => {
+      child.kill();
+      finish(failureResult(
+        'SERVICE_UNAVAILABLE',
+        'Face verification took too long. Please try again.'
+      ));
+    }, PYTHON_TIMEOUT_MS);
+
+    child.stdout.on('data', (chunk: Buffer) => {
+      stdout += chunk.toString('utf8');
+      if (Buffer.byteLength(stdout, 'utf8') > MAX_PROCESS_OUTPUT_BYTES) {
+        child.kill();
+        finish(failureResult(
+          'SERVICE_UNAVAILABLE',
+          'Unable to complete face verification. Please try again.'
+        ));
+      }
+    });
+
+    child.stderr.on('data', (chunk: Buffer) => {
+      stderr += chunk.toString('utf8');
+      if (Buffer.byteLength(stderr, 'utf8') > MAX_PROCESS_OUTPUT_BYTES) {
+        child.kill();
+      }
+    });
+
+    child.on('error', error => {
+      console.error('[PythonFaceService] Failed to start verifier:', error.message);
+      finish(failureResult(
+        'SERVICE_UNAVAILABLE',
+        'Face verification service is unavailable. Please try again.'
+      ));
+    });
+
+    child.on('close', exitCode => {
+      if (settled) return;
+
+      if (exitCode !== 0) {
+        console.error('[PythonFaceService] Verifier exited unexpectedly:', {
+          exitCode,
+          stderr: stderr.slice(0, 1000)
+        });
+        finish(failureResult(
+          'SERVICE_UNAVAILABLE',
+          'Unable to complete face verification. Please try again.'
+        ));
+        return;
+      }
+
+      try {
+        const jsonLine = stdout
+          .trim()
+          .split(/\r?\n/)
+          .reverse()
+          .find(line => line.trim().startsWith('{'));
+        const parsed: unknown = JSON.parse(jsonLine || '{}');
+        if (!isPythonFaceResult(parsed)) throw new Error('Unexpected verifier response');
+        finish(parsed);
+      } catch (error) {
+        console.error('[PythonFaceService] Invalid verifier response:', error);
+        finish(failureResult(
+          'SERVICE_UNAVAILABLE',
+          'Unable to complete face verification. Please try again.'
+        ));
+      }
+    });
+
+    child.stdin.on('error', error => {
+      if (!settled) {
+        console.error('[PythonFaceService] Could not send camera image:', error.message);
+      }
+    });
+    child.stdin.end(liveImageBuffer);
   });
 }
