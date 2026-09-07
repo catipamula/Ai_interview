@@ -75,6 +75,7 @@ export default function DeviceCheckPage({
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const candidateProctorRef = useRef<ProctoringService | null>(null);
+  const livenessBaselineRef = useRef<{ x: number; y: number; width: number } | null>(null);
   const [stream, setStream] = useState<MediaStream | null>(null);
   const [error, setError] = useState('');
   const [audioLevel, setAudioLevel] = useState(0);
@@ -84,10 +85,10 @@ export default function DeviceCheckPage({
     'Position your face clearly inside the camera, with only one person visible.'
   );
   const [liveDetections, setLiveDetections] = useState<LiveDetection[]>([]);
-  const [liveFaceBox, setLiveFaceBox] = useState<[number, number, number, number] | null>(null);
   const [liveStatus, setLiveStatus] = useState('Detecting live face...');
   const [liveStatusColor, setLiveStatusColor] = useState('#60a5fa');
   const [videoSize, setVideoSize] = useState({ width: 640, height: 480 });
+  const [faceOverlay, setFaceOverlay] = useState<{ right: number; top: number; width: number; height: number } | null>(null);
 
   useEffect(() => {
     let disposed = false;
@@ -169,11 +170,33 @@ export default function DeviceCheckPage({
         const person = detections.filter(item => item.kind === 'person').sort((a, b) => b.score - a.score)[0];
         if (person) {
           const [x, y, width, height] = person.bbox;
-          setLiveFaceBox([x + width * 0.25, y + height * 0.03, width * 0.5, height * 0.32]);
-          setLiveStatus('Face matched successfully');
-          setLiveStatusColor('#10b981');
+          const center = { x: x + width / 2, y: y + height * 0.18, width };
+          const sourceWidth = video.videoWidth || 640;
+          const sourceHeight = video.videoHeight || 480;
+          const squareSize = Math.min(width * 0.72, height * 0.48);
+          const squareX = x + (width - squareSize) / 2;
+          const squareY = Math.max(0, y + height * 0.01);
+          setFaceOverlay({
+            right: (squareX / sourceWidth) * 100,
+            top: (squareY / sourceHeight) * 100,
+            width: (squareSize / sourceWidth) * 100,
+            height: (squareSize / sourceHeight) * 100
+          });
+          const baseline = livenessBaselineRef.current;
+          if (!baseline) {
+            livenessBaselineRef.current = center;
+            setLiveStatus('Live face detected — move slightly');
+            setLiveStatusColor('#fbbf24');
+          } else {
+            const movement = Math.hypot(center.x - baseline.x, center.y - baseline.y);
+            if (movement >= Math.max(10, baseline.width * 0.06)) {
+              setLiveStatus('Liveness verified');
+              setLiveStatusColor('#10b981');
+            }
+          }
         } else {
-          setLiveFaceBox(null);
+          livenessBaselineRef.current = null;
+          setFaceOverlay(null);
           setLiveStatus('Detecting live face...');
           setLiveStatusColor('#60a5fa');
         }
@@ -356,18 +379,9 @@ export default function DeviceCheckPage({
             const [x, y, width, height] = detection.bbox;
             return <div key={`${detection.label}-${index}`} aria-hidden="true" style={{ position: 'absolute', right: `${(x / videoWidth) * 100}%`, top: `${(y / videoHeight) * 100}%`, width: `${(width / videoWidth) * 100}%`, height: `${(height / videoHeight) * 100}%`, border: '3px solid #ef4444', boxShadow: '0 0 12px #ef4444', pointerEvents: 'none' }}><span style={{ position: 'absolute', left: 0, top: 0, transform: 'translateY(-100%)', whiteSpace: 'nowrap', padding: '3px 7px', color: '#fff', backgroundColor: '#ef4444', fontSize: '0.68rem', fontWeight: 700 }}>{detection.label} {Math.round(detection.score * 100)}%</span></div>;
           })}
-          {stream && liveFaceBox && (() => {
-            const videoWidth = videoSize.width;
-            const videoHeight = videoSize.height;
-            const [rawX, rawY, rawWidth, rawHeight] = liveFaceBox;
-            const paddingX = rawWidth * 0.2;
-            const paddingY = rawHeight * 0.25;
-            const x = Math.max(0, rawX - paddingX);
-            const y = Math.max(0, rawY - paddingY);
-            const width = Math.min(videoWidth - x, rawWidth + paddingX * 2);
-            const height = Math.min(videoHeight - y, rawHeight + paddingY * 2);
-            return <div aria-hidden="true" style={{ position: 'absolute', right: `${(x / videoWidth) * 100}%`, top: `${(y / videoHeight) * 100}%`, width: `${(width / videoWidth) * 100}%`, height: `${(height / videoHeight) * 100}%`, border: `3px solid ${liveStatusColor}`, borderRadius: '18%', boxShadow: `0 0 16px ${liveStatusColor}`, pointerEvents: 'none', transition: 'all .2s linear' }} />;
-          })()}
+          {stream && faceOverlay && (
+            <div aria-hidden="true" style={{ position: 'absolute', right: `${faceOverlay.right}%`, top: `${faceOverlay.top}%`, width: `${faceOverlay.width}%`, height: `${faceOverlay.height}%`, border: `3px solid ${liveStatusColor}`, borderRadius: '10px', boxShadow: `0 0 14px ${liveStatusColor}`, pointerEvents: 'none', transition: 'all .18s linear' }} />
+          )}
           {stream && <div role="status" aria-live="polite" style={{ position: 'absolute', left: '50%', bottom: '8px', transform: 'translateX(-50%)', whiteSpace: 'nowrap', borderRadius: '999px', padding: '4px 10px', color: '#fff', backgroundColor: liveStatusColor, fontSize: '0.72rem', fontWeight: 700 }}>{verificationState === 'success' ? 'Face matched successfully' : liveStatus}</div>}
           {!stream && !error && (
             <div style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#64748b' }}>

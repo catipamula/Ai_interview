@@ -89,7 +89,7 @@ function captureVideoSnapshot(video: HTMLVideoElement): string | null {
 // Compatibility for the existing retry/countdown flow. Live face coordinates
 // now come from the single COCO runtime, avoiding face-api's TensorFlow conflict.
 const faceValidation = {
-  quickCheck: async (video: HTMLVideoElement) => ({
+  quickCheck: async (video: HTMLVideoElement, _candidateImageUrl?: string | null) => ({
     match: true,
     score: 1,
     snapshot: captureVideoSnapshot(video),
@@ -114,6 +114,7 @@ export default function SessionPage({ params }: { params: Promise<{ token: strin
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const speechRecognitionRef = useRef<SpeechRecognitionLike | null>(null);
   const proctorRef = useRef<ProctoringService | null>(null);
+  const livenessBaselineRef = useRef<{ x: number; y: number; width: number } | null>(null);
   const [loadingQuestion, setLoadingQuestion] = useState(true);
   const [questionError, setQuestionError] = useState('');
   const [proctorStatus, setProctorStatus] = useState('Initializing proctoring...');
@@ -132,7 +133,7 @@ export default function SessionPage({ params }: { params: Promise<{ token: strin
   const [faceHint, setFaceHint] = useState('Keep your face centered, well lit, and large enough to fill at least 5% of the camera frame.');
   const [liveFaceState, setLiveFaceState] = useState<LiveFaceState>('detecting');
   const [liveDetections, setLiveDetections] = useState<LiveDetection[]>([]);
-  const [liveFaceBox, setLiveFaceBox] = useState<[number, number, number, number] | null>(null);
+  const [faceOverlay, setFaceOverlay] = useState<{ right: number; top: number; width: number; height: number } | null>(null);
   const faceCheckInterval = useRef<NodeJS.Timeout | null>(null);
   const countdownInterval = useRef<NodeJS.Timeout | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -179,15 +180,38 @@ export default function SessionPage({ params }: { params: Promise<{ token: strin
           const people = detections.filter(item => item.kind === 'person');
           const person = people.sort((a, b) => b.score - a.score)[0];
           if (!person) {
-            setLiveFaceBox(null);
+            livenessBaselineRef.current = null;
+            setFaceOverlay(null);
             setLiveFaceState('detecting');
             setFaceHint('Detecting live face...');
             return;
           }
           const [x, y, width, height] = person.bbox;
-          setLiveFaceBox([x + width * 0.25, y + height * 0.03, width * 0.5, height * 0.32]);
-          setLiveFaceState('matched');
-          setFaceHint(people.length > 1 ? 'Multiple people detected.' : 'Face matched successfully.');
+          const center = { x: x + width / 2, y: y + height * 0.18, width };
+          const sourceWidth = videoRef.current?.videoWidth || 640;
+          const sourceHeight = videoRef.current?.videoHeight || 480;
+          const squareSize = Math.min(width * 0.72, height * 0.48);
+          const squareX = x + (width - squareSize) / 2;
+          const squareY = Math.max(0, y + height * 0.01);
+          setFaceOverlay({
+            right: (squareX / sourceWidth) * 100,
+            top: (squareY / sourceHeight) * 100,
+            width: (squareSize / sourceWidth) * 100,
+            height: (squareSize / sourceHeight) * 100
+          });
+          const baseline = livenessBaselineRef.current;
+          if (!baseline) {
+            livenessBaselineRef.current = center;
+            setLiveFaceState('live');
+            setFaceHint('Live face detected. Move slightly to maintain liveness.');
+          } else {
+            const movement = Math.hypot(center.x - baseline.x, center.y - baseline.y);
+            if (movement >= Math.max(10, baseline.width * 0.06)) {
+              setLiveFaceState('matched');
+              setFaceHint(people.length > 1 ? 'Multiple people detected.' : 'Liveness verified.');
+              livenessBaselineRef.current = center;
+            }
+          }
         });
         proctor.initialize()
           .then((objectModelReady) => {
@@ -236,6 +260,10 @@ export default function SessionPage({ params }: { params: Promise<{ token: strin
 
   function startPeriodicFaceCheck() {
     if (faceCheckInterval.current) clearInterval(faceCheckInterval.current);
+    // Live presence and movement are handled by the single COCO detection
+    // callback. Do not start the retired face-api comparison loop.
+    return;
+
     if (!candidateImage || !videoRef.current) return;
 
     const checkFace = async () => {
@@ -624,7 +652,7 @@ export default function SessionPage({ params }: { params: Promise<{ token: strin
               muted
               style={{ width: '100%', height: '100%', objectFit: 'cover', transform: 'scaleX(-1)' }}
             />
-            {liveDetections.map((detection, index) => {
+            {liveDetections.filter(item => item.kind === 'restricted').map((detection, index) => {
               const videoWidth = videoRef.current?.videoWidth || 640;
               const videoHeight = videoRef.current?.videoHeight || 480;
               const [x, y, width, height] = detection.bbox;
@@ -637,19 +665,9 @@ export default function SessionPage({ params }: { params: Promise<{ token: strin
                 </div>
               );
             })}
-            {liveFaceBox && (() => {
-              const videoWidth = videoRef.current?.videoWidth || 640;
-              const videoHeight = videoRef.current?.videoHeight || 480;
-              const [rawX, rawY, rawWidth, rawHeight] = liveFaceBox;
-              const paddingX = rawWidth * 0.2;
-              const paddingY = rawHeight * 0.25;
-              const x = Math.max(0, rawX - paddingX);
-              const y = Math.max(0, rawY - paddingY);
-              const width = Math.min(videoWidth - x, rawWidth + paddingX * 2);
-              const height = Math.min(videoHeight - y, rawHeight + paddingY * 2);
-              const color = LIVE_FACE_PRESENTATION[liveFaceState].color;
-              return <div aria-hidden="true" style={{ position: 'absolute', right: `${(x / videoWidth) * 100}%`, top: `${(y / videoHeight) * 100}%`, width: `${(width / videoWidth) * 100}%`, height: `${(height / videoHeight) * 100}%`, border: `3px solid ${color}`, borderRadius: '18%', boxShadow: `0 0 14px ${color}`, pointerEvents: 'none', transition: 'all .2s linear' }} />;
-            })()}
+            {faceOverlay && (
+              <div aria-hidden="true" style={{ position: 'absolute', right: `${faceOverlay.right}%`, top: `${faceOverlay.top}%`, width: `${faceOverlay.width}%`, height: `${faceOverlay.height}%`, border: `3px solid ${LIVE_FACE_PRESENTATION[liveFaceState].color}`, borderRadius: '10px', boxShadow: `0 0 14px ${LIVE_FACE_PRESENTATION[liveFaceState].color}`, pointerEvents: 'none', transition: 'all .18s linear' }} />
+            )}
             <div style={{ position: 'absolute', bottom: '8px', left: '8px', padding: '4px 8px', backgroundColor: 'rgba(0,0,0,0.6)', borderRadius: '4px', fontSize: '0.7rem', color: '#94a3b8' }}>
               Live
             </div>
